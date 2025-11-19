@@ -39,6 +39,21 @@ class TurnIngestController extends Controller
         }
     }
 
+    private function unwrapJsonContent(?string $content): string
+    {
+        $trimmed = trim($content ?? '');
+        if ($trimmed === '') {
+            return '';
+        }
+
+        if (Str::startsWith($trimmed, '```')) {
+            $trimmed = preg_replace('/^```[a-zA-Z]*\s*/', '', $trimmed) ?? $trimmed;
+            $trimmed = preg_replace('/```$/', '', $trimmed) ?? $trimmed;
+        }
+
+        return trim($trimmed);
+    }
+
     public function health()
     {
         return response()->json(['ok' => true, 'ts' => now()->toIso8601String()]);
@@ -191,7 +206,20 @@ class TurnIngestController extends Controller
         $chatModel = $openAiSetting?->default_model ?? 'gpt-4o-mini';
         $systemPrompt = $openAiSetting?->instructions ?? "You are a concise, friendly IVR assistant.";
 
-        return DB::transaction(function () use ($userFileRel, $data, $call, $openaiKey, $whisperModel, $chatModel, $systemPrompt, $tenant, $assistantDirFullUrl,$assistantDirRel, $userAudioAsset, $logError) {
+        $structuredResponseInstruction = <<<PROMPT
+Reply using JSON with the following shape:
+{
+  "reply": "<concise spoken response>",
+  "appointment": {
+    "customer_name": "<name or null>",
+    "appointment_date": "<YYYY-MM-DD or null>",
+    "appointment_time": "<HH:MM or null>"
+  }
+}
+If there is no appointment intent, set "appointment" to null. Keep "reply" under 50 words and make it sound natural for text-to-speech.
+PROMPT;
+
+        return DB::transaction(function () use ($userFileRel, $data, $call, $openaiKey, $whisperModel, $chatModel, $systemPrompt, $tenant, $assistantDirFullUrl, $assistantDirRel, $userAudioAsset, $logError, $structuredResponseInstruction) {
             $userAbsPath = Storage::disk('public')->path($userFileRel);
 
             // 7) STT
@@ -240,6 +268,7 @@ class TurnIngestController extends Controller
             // 8) LLM Reply
             $llmRun = null;
             $replyText = $systemPrompt ?? 'Sorry, I could not process your request.';
+            $appointmentData = null;
 
             try {
                 $llmResp = Http::timeout(30)
@@ -250,13 +279,22 @@ class TurnIngestController extends Controller
                         'temperature' => 0.6,
                         'messages' => [
                             ['role' => 'system', 'content' => $systemPrompt],
+                            ['role' => 'system', 'content' => $structuredResponseInstruction],
                             ['role' => 'user', 'content' => $transcript],
                         ],
-                        'max_tokens' => 150,
+                        'max_tokens' => 220,
                     ]);
 
                 $llmJson = $llmResp->ok() ? $llmResp->json() : [];
-                $replyText = trim(data_get($llmJson, 'choices.0.message.content', $systemPrompt));
+                $rawContent = trim(data_get($llmJson, 'choices.0.message.content', ''));
+                $cleanContent = $this->unwrapJsonContent($rawContent);
+                $structured = json_decode($cleanContent, true);
+                if (json_last_error() === JSON_ERROR_NONE && is_array($structured)) {
+                    $replyText = trim($structured['reply'] ?? $replyText);
+                    $appointmentData = $structured['appointment'] ?? null;
+                } else {
+                    $replyText = $rawContent !== '' ? $rawContent : $replyText;
+                }
 
                 // ✅ Save LlmRun outside transaction so it always persists
 
@@ -274,10 +312,11 @@ class TurnIngestController extends Controller
                         'raw_request' => [
                             'messages' => [
                                 ['role' => 'system', 'content' => $systemPrompt],
+                                ['role' => 'system', 'content' => $structuredResponseInstruction],
                                 ['role' => 'user', 'content' => $transcript],
                             ],
                             'model' => $chatModel,
-                            'max_tokens' => 150,
+                            'max_tokens' => 220,
                         ],
                         'raw_response' => $llmJson,
                         'latency_ms' => 0,
@@ -297,41 +336,11 @@ class TurnIngestController extends Controller
             }
 
             // 9) Appointment Detection & Booking
-            $appointmentIntent = false;
-            $appointmentData = null;
-
-            try {
-                $llmPrompt = "Extract appointment details from this text. Reply as JSON: {customer_name, appointment_date (YYYY-MM-DD), appointment_time (HH:MM)}. If not an appointment, reply null.";
-                $llmResp2 = Http::timeout(30)
-                    ->withToken($openaiKey)
-                    ->withOptions(['verify' => false])
-                    ->post('https://api.openai.com/v1/chat/completions', [
-                        'model' => $chatModel,
-                        'messages' => [
-                            ['role' => 'system', 'content' => $systemPrompt],
-                            ['role' => 'user', 'content' => $transcript . ' ' . $llmPrompt],
-                        ],
-                        'temperature' => 0,
-                        'max_tokens' => 150,
-                    ]);
-
-                if ($llmResp2->ok()) {
-                    $jsonText = trim(data_get($llmResp2->json(), 'choices.0.message.content', 'null'));
-                    $appointmentData = json_decode($jsonText, true);
-
-                    if (is_array($appointmentData) && isset($appointmentData['customer_name'])) {
-                        $appointmentIntent = true;
-                    }
-                }
-            } catch (\Throwable $e) {
-                $logError(
-                    $tenant->id,
-                    'Appointment',
-                    'error',
-                    'Failed to parse appointment',
-                    ['trace' => $e->getMessage()]
-                );
-            }
+            $appointmentIntent = is_array($appointmentData) && (
+                !empty($appointmentData['customer_name']) ||
+                !empty($appointmentData['appointment_date']) ||
+                !empty($appointmentData['appointment_time'])
+            );
 
             if ($appointmentIntent) {
                 $temp = TempAppointment::firstOrNew([
