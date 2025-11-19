@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:video="http://www.google.com/schemas/sitemap-video/1.1" xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">
+    <url>
+    <loc>https://mimivirtualagent.com</loc>
+            </url>
+    <url>
+    <loc>https://mimivirtualagent.com/blog</loc>
+            </url>
+    <url>
+    <loc>https://mimivirtualagent.com/terms-of-service</loc>
+            </url>
+    <url>
+    <loc>https://mimivirtualagent.com/privacy-policy</loc>
+            </url>
+    <url>
+    <loc>https://mimivirtualagent.com/blog/open-ai-setting</loc>
+            </url>
+    <url>
+    <loc>https://mimivirtualagent.com/blog/category/open-ai-setting</loc>
+            </url>
+</urlset>

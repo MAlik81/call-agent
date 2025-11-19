@@ -1,0 +1,32 @@
+{
+  "resources/css/filament/admin/theme.css": {
+    "file": "assets/theme-B14I4sGN.css",
+    "src": "resources/css/filament/admin/theme.css",
+    "isEntry": true
+  },
+  "resources/css/filament/dashboard/theme.css": {
+    "file": "assets/theme-DBd8NJ3t.css",
+    "src": "resources/css/filament/dashboard/theme.css",
+    "isEntry": true
+  },
+  "resources/js/app.js": {
+    "file": "assets/app-BZOkhHfI.js",
+    "name": "app",
+    "src": "resources/js/app.js",
+    "isEntry": true
+  },
+  "resources/js/blog.js": {
+    "file": "assets/blog-xin1BGTZ.js",
+    "name": "blog",
+    "src": "resources/js/blog.js",
+    "isEntry": true,
+    "css": [
+      "assets/blog-BfC0goYb.css"
+    ]
+  },
+  "resources/sass/app.scss": {
+    "file": "assets/app-C072gC2A.css",
+    "src": "resources/sass/app.scss",
+    "isEntry": true
+  }
+}
