@@ -54,20 +54,21 @@ const wss = new WebSocket.Server({ noServer: true });
  *   lastPlayAt: 0,
  *   lastStopAt: 0,
  *   ingestInFlight: false,
- *   lastIngestAt: 0,
+ *   ingestQueue: [],
+ *   ingestWorkerActive: false,
  * })
  */
 const calls = new Map();
 
 // ---------- VAD tuning ----------
-const RMS_ON            = 0.020;   // speech starts above this
-const RMS_OFF           = 0.012;   // speech ends below this
-const SPEECH_ON_FRAMES  = 5;       // ~100ms (5x ~20ms)
-const SPEECH_OFF_FRAMES = 15;      // ~300ms
-const MIN_CHUNK_MS      = 700;     // min voiced duration before accept
-const SILENCE_SECS      = 0.40;    // silence to finalize
-const CHUNK_COOLDOWN_MS = 1600;    // min gap between ingests
-const PLAY_LOCK_MS      = 3000;    // debounce play; "playing window"
+const RMS_ON            = 0.018;   // speech starts above this
+const RMS_OFF           = 0.010;   // speech ends below this
+const SPEECH_ON_FRAMES  = 4;       // ~80ms (4x ~20ms)
+const SPEECH_OFF_FRAMES = 10;      // ~200ms
+const MIN_CHUNK_MS      = 450;     // min voiced duration before accept
+const SILENCE_SECS      = 0.25;    // silence to finalize
+const CHUNK_COOLDOWN_MS = 250;     // min gap between ingests
+const PLAY_LOCK_MS      = 2600;    // debounce play; "playing window"
 const STOP_COOLDOWN_MS  = 500;     // throttle stop spam
 
 // ---------- audio utils: μ-law -> PCM16, WAV, RMS ----------
@@ -173,6 +174,78 @@ async function handleMediaStream(ws) {
   // per-call shared state
   let callState = null;
 
+  async function drainIngestQueue() {
+    if (!callState || callState.ingestWorkerActive) return;
+    callState.ingestWorkerActive = true;
+    callState.ingestQueue = callState.ingestQueue || [];
+    while (callState.ingestQueue.length) {
+      const job = callState.ingestQueue.shift();
+      try {
+        await sendIngestJob(job);
+      } catch (err) {
+        log('error', '[INGEST] queue job failed', { callSid, err: err?.message });
+      }
+    }
+    callState.ingestWorkerActive = false;
+  }
+
+  function enqueueIngestJob(job) {
+    if (!callState) return;
+    callState.ingestQueue = callState.ingestQueue || [];
+    callState.ingestQueue.push(job);
+    callState.lastIngestAt = Date.now();
+    drainIngestQueue();
+  }
+
+  async function sendIngestJob(job = {}) {
+    if (!callState || !job.wavBuf) return;
+    const jobStreamSid = job.streamSid || streamSid;
+    const turnNumber = job.turnNumber || turns;
+    const wavBuf = job.wavBuf;
+
+    const t0 = Date.now();
+    callState.ingestInFlight = true;
+    log('info', '[INGEST] sending', { callSid, turn: turnNumber, wavBytes: wavBuf.length });
+
+    try {
+      const resp = await axios.post(
+        `${LARAVEL_API_BASE}/api/turns/ingest`,
+        {
+          tenant_id: callState.tenantId,
+          call_sid: callSid,
+          encoding: 'audio/wav;rate=8000',
+          audio_b64: wavBuf.toString('base64'),
+          meta: { streamSid: jobStreamSid },
+        },
+        { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${APP_SHARED_TOKEN}` }, timeout: 30000 }
+      );
+      const { ok, audio_url } = resp.data || {};
+      const dt = Date.now() - t0;
+      log('info', '[INGEST] response', { callSid, turn: turnNumber, ok, audio_url, ms: dt });
+
+      const playWindowOk = (Date.now() - callState.lastPlayAt) > PLAY_LOCK_MS;
+      if (ok && audio_url && !callState.playing && playWindowOk) {
+        try {
+          await axios.post(
+            `${LARAVEL_API_BASE}/api/twilio/calls/play`,
+            { tenant_id: callState.tenantId, call_sid: callSid, audio_url },
+            { headers: { Authorization: `Bearer ${APP_SHARED_TOKEN}` }, timeout: 8000 }
+          );
+          callState.playing = true;
+          callState.lastPlayAt = Date.now();
+          log('info', '[PLAY] requested', { callSid, audio_url });
+          setTimeout(() => { callState.playing = false; }, PLAY_LOCK_MS);
+        } catch (e) {
+          log('warn', '[PLAY] request failed (ignored)', { callSid, err: e?.response?.data || e.message });
+        }
+      }
+    } catch (e) {
+      log('error', '[INGEST] error', { callSid, err: e?.response?.data || e.message });
+    } finally {
+      callState.ingestInFlight = false;
+    }
+  }
+
   ws.on('message', async (raw) => {
     let data;
     try { data = JSON.parse(raw.toString()); }
@@ -199,6 +272,8 @@ async function handleMediaStream(ws) {
           lastPlayAt: 0,
           lastStopAt: 0,
           ingestInFlight: false,
+          ingestQueue: [],
+          ingestWorkerActive: false,
           lastIngestAt: 0,
         };
         calls.set(callSid, callState);
@@ -207,6 +282,7 @@ async function handleMediaStream(ws) {
         if (callState.ws && callState.ws !== ws) {
           try { callState.ws.close(); } catch {}
         }
+        callState.ingestQueue = callState.ingestQueue || [];
       }
       callState.ws = ws;
 
@@ -266,7 +342,7 @@ async function handleMediaStream(ws) {
 
       // VAD state machine
       if (state === 'IDLE') {
-        if (speechOnCount >= SPEECH_ON_FRAMES && !callState.playing && !callState.ingestInFlight) {
+        if (speechOnCount >= SPEECH_ON_FRAMES && !callState.playing) {
           state = 'SPEAKING';
           hadSpeechSinceFlush = true;
           speechStartedAt = lastSpeechAt = now;
@@ -284,7 +360,6 @@ async function handleMediaStream(ws) {
             speakingMs >= MIN_CHUNK_MS &&
             speechOffCount >= SPEECH_OFF_FRAMES &&
             silentForS >= SILENCE_SECS &&
-            !callState.ingestInFlight &&
             (now - callState.lastIngestAt) >= CHUNK_COOLDOWN_MS) {
 
           log('info', '[VAD] speaking end', { callSid, speakingMs, capturedFrames: captureMu.length });
@@ -297,57 +372,14 @@ async function handleMediaStream(ws) {
           // reset for next turn
           captureMu = [];
           hadSpeechSinceFlush = false;
-          state = 'THINKING';
-          callState.ingestInFlight = true;
-          callState.lastIngestAt = now;
+          state = 'IDLE';
+          speechOnCount = 0;
+          speechOffCount = 0;
+          speechStartedAt = 0;
+          lastSpeechAt = 0;
 
-          const t0 = Date.now();
           turns++;
-          log('info', '[INGEST] sending', { callSid, turn: turns, wavBytes: wavBuf.length });
-
-          try {
-            const resp = await axios.post(
-              `${LARAVEL_API_BASE}/api/turns/ingest`,
-              {
-                tenant_id: callState.tenantId,
-                call_sid: callSid,
-                encoding: 'audio/wav;rate=8000',
-                audio_b64: wavBuf.toString('base64'),
-                meta: { streamSid },
-              },
-              { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${APP_SHARED_TOKEN}` }, timeout: 30000 }
-            );
-            const { ok, audio_url } = resp.data || {};
-            const dt = Date.now() - t0;
-            log('info', '[INGEST] response', { callSid, turn: turns, ok, audio_url, ms: dt });
-
-            // debounce play requests
-            const playWindowOk = (Date.now() - callState.lastPlayAt) > PLAY_LOCK_MS;
-            if (ok && audio_url && !callState.playing && playWindowOk) {
-              try {
-                await axios.post(
-                  `${LARAVEL_API_BASE}/api/twilio/calls/play`,
-                  { tenant_id: callState.tenantId, call_sid: callSid, audio_url },
-                  { headers: { Authorization: `Bearer ${APP_SHARED_TOKEN}` }, timeout: 8000 }
-                );
-                callState.playing = true;
-                callState.lastPlayAt = Date.now();
-                log('info', '[PLAY] requested', { callSid, audio_url });
-
-                // unlock after a bit; Twilio reattaches stream after Play
-                setTimeout(() => { callState.playing = false; }, PLAY_LOCK_MS);
-              } catch (e) {
-                log('warn', '[PLAY] request failed (ignored)', { callSid, err: e?.response?.data || e.message });
-              }
-            }
-          } catch (e) {
-            log('error', '[INGEST] error', { callSid, err: e?.response?.data || e.message });
-          } finally {
-            callState.ingestInFlight = false;
-            state = 'IDLE';
-            speechOnCount = 0;
-            speechOffCount = 0;
-          }
+          enqueueIngestJob({ wavBuf, streamSid, turnNumber: turns });
         }
       }
       return;
