@@ -3,7 +3,7 @@
 namespace App\Http\Controllers\Telephony;
 
 use App\Http\Controllers\Controller;
-use App\Models\Tenant;
+use App\Models\CallSession;
 use App\Models\TwilioSetting;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -32,20 +32,58 @@ class TwilioVoiceWebhookController extends Controller
      * Lookup tenant by incoming number.
      * First try DB mapping via TwilioSetting, else fallback to env default.
      */
-    private function mapTenantIdByNumber(?string $to): ?string
+    private function normalizeNumber(?string $number): ?string
     {
-        if (!$to) {
-            return null; // no number, no tenant
+        if (!$number) {
+            return null;
         }
 
-        $setting = TwilioSetting::whereJsonContains('phone_numbers', $to)->first();
+        $normalized = preg_replace('/[^0-9+]/', '', $number);
 
-        if ($setting && $setting->tenant) {
-            return $setting->tenant->id; // return tenant ID from Tenant model
+        if (!$normalized) {
+            return null;
         }
 
-        $defaultTenant = Tenant::first(); // pick first tenant as default
-        return $defaultTenant ? $defaultTenant->id : null;
+        // Ensure leading + for E.164 numbers
+        if ($normalized[0] !== '+') {
+            $normalized = '+' . ltrim($normalized, '+');
+        }
+
+        return $normalized;
+    }
+
+
+
+    private function candidateNumbers(?string $number): array
+    {
+        $normalized = $this->normalizeNumber($number);
+
+        if (!$normalized) {
+            return [];
+        }
+
+        $candidates = [$normalized];
+
+        // Some numbers may be stored without the leading +
+        $candidates[] = ltrim($normalized, '+');
+
+        return array_values(array_unique(array_filter($candidates)));
+    }
+
+
+    private function resolveTwilioSettingByNumber(?string $number): ?TwilioSetting
+    {
+        foreach ($this->candidateNumbers($number) as $candidate) {
+            $setting = TwilioSetting::with('tenant')
+                ->whereJsonContains('phone_numbers', $candidate)
+                ->first();
+
+            if ($setting) {
+                return $setting;
+            }
+        }
+
+        return null;
     }
 
 
@@ -56,7 +94,7 @@ class TwilioVoiceWebhookController extends Controller
         if (!$to)
             return false;
 
-        $setting = TwilioSetting::whereJsonContains('phone_numbers', $to)->first();
+        $setting = $this->resolveTwilioSettingByNumber($to);
 
         if (!$setting || !$setting->auth_token_encrypted) {
             return false; // cannot validate without DB token
@@ -87,34 +125,63 @@ class TwilioVoiceWebhookController extends Controller
         $from = $request->input('From') ?? $request->input('Caller');
 
         // Try mapping tenant
-        $tenantId = $this->mapTenantIdByNumber($to);
+        $twilioSetting = $this->resolveTwilioSettingByNumber($to);
+        $tenant = $twilioSetting?->tenant;
 
-        if (!$tenantId) {
+        if (!$tenant) {
             Log::error('TWILIO_TENANT_NOT_FOUND', compact('callSid', 'to', 'from'));
             return response('Tenant not found for this number', 404)
                 ->header('Content-Type', 'text/plain');
         }
 
+        $callSession = CallSession::firstOrNew(['call_sid' => $callSid]);
+        $callSession->tenant_id = $tenant->id;
+        $callSession->from_number = $from;
+        $callSession->to_number = $to;
+        $callSession->status = 'active';
+        $callSession->direction = 'inbound';
+        if (!$callSession->exists) {
+            $callSession->started_at = now();
+        }
+        $callSession->save();
+
+        $callId = $callSession->id;
+
         // Log call data into storage/logs/laravel.log (or your file)
-        Log::info('TWILIO_INCOMING', compact('callSid', 'to', 'from', 'tenantId'));
+        Log::info('TWILIO_INCOMING', [
+            'callSid' => $callSid,
+            'callId' => $callId,
+            'to' => $to,
+            'from' => $from,
+            'tenantId' => $tenant->id,
+        ]);
 
         // Minimal TwiML: attach WS stream
-        $wss = 'wss://socket.theurl.co/media-stream';
+        $wss = 'wss://' . $this->proxyHost() . '/media-stream';
+        $query = http_build_query([
+            'call_id' => $callId,
+            'call_sid' => $callSid,
+            'tenant_id' => $tenant->id,
+            'tenant_uuid' => $tenant->uuid,
+        ]);
 
-        $tenantXml = htmlspecialchars($tenantId, ENT_QUOTES);
+        $tenantXml = htmlspecialchars($tenant->id, ENT_QUOTES);
+        $tenantUuidXml = htmlspecialchars($tenant->uuid ?? '', ENT_QUOTES);
         $callXml = htmlspecialchars($callSid ?? '', ENT_QUOTES);
+        $callIdXml = htmlspecialchars((string) $callId, ENT_QUOTES);
+        $streamUrl = $wss . '?' . $query;
 
         $twiml = <<<XML
 <?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">Conneting</Say>
-  <Start>
-    <Stream url="{$wss}">
+  <Connect>
+    <Stream url="{$streamUrl}">
       <Parameter name="tenant_id" value="{$tenantXml}"/>
+      <Parameter name="tenant_uuid" value="{$tenantUuidXml}"/>
       <Parameter name="call_sid"  value="{$callXml}"/>
+      <Parameter name="call_id"  value="{$callIdXml}"/>
     </Stream>
-  </Start>
-  <Pause length="600"/>
+  </Connect>
 </Response>
 XML;
 
