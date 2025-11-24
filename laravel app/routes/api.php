@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Telephony\TwilioCallControlController;
 use App\Http\Controllers\Turns\TurnIngestController; // from prev step
 use App\Http\Controllers\Telephony\TwilioVoiceWebhookController;
+use App\Http\Controllers\Telephony\VoiceBootstrapController;
 
 
 
@@ -14,6 +15,8 @@ Route::get('/health',        [TurnIngestController::class, 'health']);
 Route::post('/turns/ingest', [TurnIngestController::class, 'ingest']);
 
 Route::get('/ws-health', [TurnIngestController::class, 'wsHealth']);
+
+Route::middleware('auth:sanctum')->post('/voice/bootstrap', [VoiceBootstrapController::class, 'bootstrap']);
 
 
 // new
