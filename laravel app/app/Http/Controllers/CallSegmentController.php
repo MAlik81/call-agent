@@ -71,7 +71,7 @@ class CallSegmentController extends Controller
 
         $audioAsset = AudioAsset::create([
             'tenant_id' => $tenantId,
-            'kind' => 'upload_chunk',
+            'kind' => 'call_segment',
             'storage_disk' => 'public',
             'path' => $path,
             'mime' => 'audio/' . strtolower($extension),
