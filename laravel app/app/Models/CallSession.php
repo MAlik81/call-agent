@@ -76,6 +76,11 @@ class CallSession extends Model
     return $this->hasMany(CallMessages::class);
 }
 
+    public function segments()
+    {
+        return $this->hasMany(CallSegment::class);
+    }
+
 
     /**
      * Mark the call as completed and set ended_at timestamp.

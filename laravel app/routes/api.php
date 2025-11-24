@@ -8,6 +8,7 @@ use App\Http\Controllers\Telephony\TwilioCallControlController;
 use App\Http\Controllers\Turns\TurnIngestController; // from prev step
 use App\Http\Controllers\Telephony\TwilioVoiceWebhookController;
 use App\Http\Controllers\Telephony\VoiceBootstrapController;
+use App\Http\Controllers\CallSegmentController;
 
 
 
@@ -22,6 +23,8 @@ Route::middleware('auth:sanctum')->post('/voice/bootstrap', [VoiceBootstrapContr
 // new
 Route::post('/twilio/calls/play', [TwilioCallControlController::class, 'play']);
 Route::post('/twilio/calls/stop', [TwilioCallControlController::class, 'stop']);
+
+Route::post('/call-sessions/{call}/segments', [CallSegmentController::class, 'store']);
 
 
 
