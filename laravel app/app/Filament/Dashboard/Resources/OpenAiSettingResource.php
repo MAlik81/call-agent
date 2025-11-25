@@ -83,8 +83,8 @@ class OpenAiSettingResource extends Resource
                                 Forms\Components\Select::make('realtime_model')
                                     ->label('Realtime Model')
                                     ->options([
-                                        'gpt-4o-realtime-preview' => 'gpt-4o-realtime-preview',
-                                        'gpt-4o-realtime-mini' => 'gpt-4o-realtime-mini',
+                                        'gpt-realtime' => 'gpt-realtime',
+                                        'gpt-realtime-mini' => 'gpt-realtime-mini',
                                     ])
                                     ->placeholder('Select a realtime model')
                                     ->visible(fn ($get) => (bool) $get('realtime_enabled')),

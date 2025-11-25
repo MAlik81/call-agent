@@ -519,6 +519,8 @@ async function handleMediaStream(ws) {
 
   async function ensureRealtimeSession() {
     const state = ensureCallState();
+    // log state
+    log('debug', '[REALTIME] ensure session', { callSid, stateBootstrap: !!state?.bootstrap, realtimeReady: !!state?.realtime?.ready });
     if (!state?.bootstrap?.config?.realtime_enabled) return null;
 
     const apiKey = state.bootstrap?.openai_api_key || OPENAI_API_KEY;
