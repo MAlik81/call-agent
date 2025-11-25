@@ -33,6 +33,7 @@ const {
   PORT = 3000,
   LARAVEL_API_BASE,
   APP_SHARED_TOKEN,
+  OPENAI_API_KEY,
 } = process.env;
 
 if (!LARAVEL_API_BASE || !APP_SHARED_TOKEN) {
@@ -217,6 +218,7 @@ async function handleMediaStream(ws) {
           lastIngestAt: 0,
           bootstrap: null,
           bootstrapFetched: false,
+          realtime: null,
         };
         calls.set(newKey, callState);
       } else {
@@ -262,6 +264,104 @@ async function handleMediaStream(ws) {
     }
 
     return state.bootstrap;
+  }
+
+  function buildRealtimeInstructions(config = {}) {
+    const sections = [];
+    if (config.realtime_system_prompt) sections.push(config.realtime_system_prompt);
+    else if (config.prompt) sections.push(config.prompt);
+
+    if (Array.isArray(config.rules) && config.rules.length) {
+      const rules = config.rules.map((r, i) => `${i + 1}. ${r}`).join('\n');
+      sections.push(`Call rules:\n${rules}`);
+    }
+
+    return sections.filter(Boolean).join('\n\n');
+  }
+
+  function attachRealtimeKeepAlive(state) {
+    if (!state?.realtime?.ws) return;
+    if (state.realtime.keepAlive) clearInterval(state.realtime.keepAlive);
+
+    state.realtime.keepAlive = setInterval(() => {
+      try { state.realtime.ws.ping(); } catch { clearInterval(state.realtime.keepAlive); }
+    }, 10000);
+  }
+
+  function closeRealtime(state) {
+    if (!state?.realtime) return;
+    if (state.realtime.keepAlive) {
+      clearInterval(state.realtime.keepAlive);
+      state.realtime.keepAlive = null;
+    }
+    if (state.realtime.ws && state.realtime.ws.readyState === WebSocket.OPEN) {
+      try { state.realtime.ws.close(); } catch {}
+    }
+    state.realtime.ws = null;
+    state.realtime.ready = false;
+  }
+
+  async function ensureRealtimeSession() {
+    const state = ensureCallState();
+    if (!state?.bootstrap?.config?.realtime_enabled) return null;
+
+    if (!OPENAI_API_KEY) {
+      log('warn', '[REALTIME] skipped: missing OPENAI_API_KEY', { callSid });
+      return null;
+    }
+
+    if (state.realtime?.ready && state.realtime.ws?.readyState === WebSocket.OPEN) return state.realtime;
+
+    const config = state.bootstrap.config || {};
+    const model = config.realtime_model || 'gpt-4o-realtime-preview';
+    const rtUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
+
+    const rtWs = new WebSocket(rtUrl, {
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    });
+
+    state.realtime = { ws: rtWs, ready: false, keepAlive: null };
+
+    rtWs.on('open', () => {
+      const instructions = buildRealtimeInstructions(config);
+      const sessionUpdate = {
+        type: 'session.update',
+        session: {
+          model,
+          voice: config.realtime_voice || undefined,
+          language: config.realtime_language || undefined,
+          input_audio_format: 'g711_ulaw',
+          output_audio_format: 'g711_ulaw',
+          input_audio_transcription: { enabled: true },
+          modalities: ['text', 'audio'],
+          instructions,
+        },
+      };
+
+      try { rtWs.send(JSON.stringify(sessionUpdate)); }
+      catch (e) { log('error', '[REALTIME] failed to send session.update', { callSid, err: e?.message }); }
+
+      state.realtime.ready = true;
+      attachRealtimeKeepAlive(state);
+      log('info', '[REALTIME] session opened', { callSid, model });
+    });
+
+    rtWs.on('message', (msg) => {
+      if (LOG_LEVEL >= LOG_LEVELS.debug) {
+        log('debug', '[REALTIME] message', { callSid, bytes: msg?.length || 0 });
+      }
+    });
+
+    rtWs.on('close', () => {
+      log('info', '[REALTIME] session closed', { callSid });
+      closeRealtime(state);
+    });
+
+    rtWs.on('error', (err) => {
+      log('error', '[REALTIME] socket error', { callSid, err: err?.message });
+    });
+
+    return state.realtime;
   }
 
   async function drainIngestQueue() {
@@ -368,6 +468,7 @@ async function handleMediaStream(ws) {
 
       log('info', '[WS] start', { streamSid, callSid, tenantId, callId, toNumber });
       await fetchBootstrapConfig();
+      await ensureRealtimeSession();
       return;
     }
 
@@ -480,6 +581,7 @@ async function handleMediaStream(ws) {
     if (key && calls.get(key)?.ws === ws) {
       calls.get(key).ws = null;
     }
+    closeRealtime(callState);
     log('info', '[WS] closed', { callSid, chunksIn, bytesIn, turns });
   });
 
