@@ -340,6 +340,8 @@ async function handleMediaStream(ws) {
     enqueueSegmentJob({
       role: 'assistant',
       segmentIndex,
+      format: 'pcm16',
+      sampleRate: REALTIME_SAMPLE_RATE,
       audioB64,
       startedAt: startTs,
       endedAt: now,
@@ -366,6 +368,8 @@ async function handleMediaStream(ws) {
     enqueueSegmentJob({
       role: 'user',
       segmentIndex,
+      format: 'pcm16',
+      sampleRate: REALTIME_SAMPLE_RATE,
       audioB64,
       startedAt: startTs,
       endedAt: now,
@@ -399,6 +403,8 @@ async function handleMediaStream(ws) {
     const payload = {};
     if (state.callId) payload.call_id = state.callId;
     if (state.toNumber) payload.to_number = state.toNumber;
+    if (state.tenantId) payload.tenant_id = state.tenantId;
+    if (state.tenantUuid) payload.tenant_uuid = state.tenantUuid;
 
     if (!payload.call_id && !payload.to_number) {
       log('warn', '[BOOTSTRAP] skipped: missing call_id and to_number', { callSid });
@@ -518,6 +524,16 @@ async function handleMediaStream(ws) {
       return;
     }
 
+    const format = (typeof job.format === 'string' && job.format.trim()) ? job.format.trim() : 'pcm16';
+    const sampleRateCandidate = Number(job.sampleRate);
+    const sampleRate = Number.isFinite(sampleRateCandidate) ? sampleRateCandidate : REALTIME_SAMPLE_RATE;
+    const audioB64 = job.audioB64;
+
+    if (!audioB64) {
+      log('warn', '[SEGMENT] skipped: missing audio payload', { callSid, role: job.role, idx: job.segmentIndex });
+      return;
+    }
+
     const url = `${LARAVEL_API_BASE}/api/call-sessions/${encodeURIComponent(sessionId)}/segments`;
     const payload = {
       role: job.role,
@@ -525,8 +541,10 @@ async function handleMediaStream(ws) {
       call_id: callState?.callId || null,
       call_sid: callSid || null,
       tenant_id: callState?.tenantId || tenantId || null,
-      audio_b64: job.audioB64,
-      metadata: {
+      format,
+      sample_rate: sampleRate,
+      audio_b64: audioB64,
+      meta: {
         started_at: job.startedAt ? new Date(job.startedAt).toISOString() : null,
         ended_at: job.endedAt ? new Date(job.endedAt).toISOString() : null,
         duration_ms: job.durationMs || null,
@@ -541,11 +559,11 @@ async function handleMediaStream(ws) {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         await axios.post(url, payload, { headers, timeout: 10000 });
-        log('info', '[SEGMENT] posted', { callSid, role: job.role, idx: job.segmentIndex, attempt });
+        log('info', '[SEGMENT] posted', { callSid, role: job.role, idx: job.segmentIndex, attempt, format, sampleRate, audioBytes: audioB64.length });
         return;
       } catch (err) {
         const errData = err?.response?.data || err.message;
-        log('warn', '[SEGMENT] post failed', { callSid, role: job.role, idx: job.segmentIndex, attempt, err: errData });
+        log('warn', '[SEGMENT] post failed', { callSid, role: job.role, idx: job.segmentIndex, attempt, format, sampleRate, audioBytes: audioB64.length, err: errData });
         if (attempt < 3) await new Promise((res) => setTimeout(res, attempt * 500));
       }
     }
@@ -740,11 +758,13 @@ async function handleMediaStream(ws) {
       if (Array.isArray(cp)) {
         for (const item of cp) {
           if (item?.name === 'tenant_id') tenantId = item.value;
+          if (item?.name === 'tenant_uuid') tenantUuid = item.value;
           if (item?.name === 'call_id') callId = Number.parseInt(item.value, 10) || callId;
           if (item?.name === 'to_number') toNumber = item.value || toNumber;
         }
       } else if (cp && typeof cp === 'object') {
         tenantId = cp.tenant_id || tenantId;
+        tenantUuid = cp.tenant_uuid || tenantUuid;
         callId = Number.parseInt(cp.call_id, 10) || callId;
         toNumber = cp.to_number || toNumber;
       }
