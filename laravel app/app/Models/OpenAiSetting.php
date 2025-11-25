@@ -19,11 +19,17 @@ class OpenAiSetting extends Model
         'default_model',
         'stt_model',
         'instructions',
+        'realtime_enabled',
+        'realtime_model',
+        'realtime_system_prompt',
+        'realtime_voice',
+        'realtime_language',
         'extra',
     ];
 
     protected $casts = [
         'allow_override' => 'boolean',
+        'realtime_enabled' => 'boolean',
         'extra' => 'array',
     ];
 

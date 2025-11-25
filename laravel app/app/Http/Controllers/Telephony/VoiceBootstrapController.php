@@ -45,6 +45,11 @@ class VoiceBootstrapController extends Controller
             'prompt' => $openAiSetting?->instructions ?? '',
             'voice' => $elevenLabsSetting?->elevenlabs_voice_id,
             'language' => $elevenLabsSetting?->language,
+            'realtime_enabled' => (bool) ($openAiSetting?->realtime_enabled ?? false),
+            'realtime_model' => $openAiSetting?->realtime_model ?? 'gpt-4o-realtime-preview',
+            'realtime_system_prompt' => $openAiSetting?->realtime_system_prompt,
+            'realtime_voice' => $openAiSetting?->realtime_voice ?? $elevenLabsSetting?->elevenlabs_voice_id,
+            'realtime_language' => $openAiSetting?->realtime_language ?? $elevenLabsSetting?->language,
             'rules' => $rules,
         ];
 

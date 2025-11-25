@@ -73,6 +73,44 @@ class OpenAiSettingResource extends Resource
                             ->default('whisper-1')
                             ->required(),
 
+                        Forms\Components\Grid::make()
+                            ->columns(2)
+                            ->schema([
+                                Forms\Components\Toggle::make('realtime_enabled')
+                                    ->label('Enable Realtime')
+                                    ->helperText('Toggle to use realtime Chat Completions where supported.')
+                                    ->default(false),
+                                Forms\Components\Select::make('realtime_model')
+                                    ->label('Realtime Model')
+                                    ->options([
+                                        'gpt-4o-realtime-preview' => 'gpt-4o-realtime-preview',
+                                        'gpt-4o-realtime-mini' => 'gpt-4o-realtime-mini',
+                                    ])
+                                    ->placeholder('Select a realtime model')
+                                    ->visible(fn ($get) => (bool) $get('realtime_enabled')),
+                            ]),
+
+                        Forms\Components\Textarea::make('realtime_system_prompt')
+                            ->label('Realtime System Prompt')
+                            ->rows(3)
+                            ->helperText('Optional system prompt that will be sent with realtime requests.')
+                            ->visible(fn ($get) => (bool) $get('realtime_enabled')),
+
+                        Forms\Components\Grid::make()
+                            ->columns(2)
+                            ->schema([
+                                Forms\Components\TextInput::make('realtime_voice')
+                                    ->label('Realtime Voice')
+                                    ->maxLength(64)
+                                    ->helperText('Optional voice identifier to use for realtime responses.')
+                                    ->visible(fn ($get) => (bool) $get('realtime_enabled')),
+                                Forms\Components\TextInput::make('realtime_language')
+                                    ->label('Realtime Language')
+                                    ->maxLength(32)
+                                    ->helperText('Optional language code to prefer during realtime interactions.')
+                                    ->visible(fn ($get) => (bool) $get('realtime_enabled')),
+                            ]),
+
 
                         Forms\Components\Grid::make()
                             ->columns(1)
