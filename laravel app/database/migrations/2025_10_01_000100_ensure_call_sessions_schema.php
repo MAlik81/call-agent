@@ -137,11 +137,14 @@ return new class extends Migration
     private function indexExists(string $table, string $indexName): bool
     {
         $connection = Schema::getConnection();
-        $schemaManager = $connection->getDoctrineSchemaManager();
+        $databaseName = $connection->getDatabaseName();
         $prefixedTableName = $connection->getTablePrefix() . $table;
 
-        $indexes = $schemaManager->listTableIndexes($prefixedTableName);
+        $indexes = $connection->select(
+            'SELECT COUNT(1) as count FROM information_schema.statistics WHERE table_schema = ? AND table_name = ? AND index_name = ?',
+            [$databaseName, $prefixedTableName, $indexName]
+        );
 
-        return array_key_exists($indexName, $indexes);
+        return !empty($indexes) && (int) $indexes[0]->count > 0;
     }
 };
