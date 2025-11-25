@@ -3,6 +3,7 @@ namespace App\Http\Controllers\Telephony;
 
 use App\Http\Controllers\Controller;
 use App\Models\CallSession;
+use App\Models\SystemSetting;
 use App\Models\TwilioSetting;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -10,21 +11,19 @@ use Twilio\Security\RequestValidator;
 
 class TwilioVoiceWebhookController extends Controller
 {
-    private function proxyHost(): string
+    private function streamUrl(): string
     {
-        $hostSetting = \App\Models\SystemSetting::where('key', 'PROXY_HOST')->first();
+        $host = SystemSetting::where('key', 'proxy_host')->value('value') ?? env('PROXY_HOST');
+        $port = (int) (SystemSetting::where('key', 'proxy_port')->value('value') ?? env('PROXY_PORT', 443));
 
-        if (! $hostSetting || empty($hostSetting->value)) {
-            abort(500, 'Missing PROXY_HOST in system_settings');
+        if (! $host) {
+            abort(500, 'Missing PROXY_HOST in system_settings or env');
         }
 
-        $host = trim($hostSetting->value);
+        $normalizedHost = trim(str_replace(['wss://', 'ws://', 'https://', 'http://'], '', $host), '/');
+        $scheme = $port === 443 ? 'wss' : 'ws';
 
-        if (empty($host)) {
-            abort(500, 'Invalid PROXY_HOST value');
-        }
-
-        return $host; // e.g. 46df29e15fda.ngrok-free.app
+        return sprintf('%s://%s:%s/media-stream', $scheme, $normalizedHost, $port ?: 443);
     }
 
     /**
@@ -150,7 +149,7 @@ class TwilioVoiceWebhookController extends Controller
             ]);
 
             // Minimal TwiML: attach WS stream
-            $wss = 'wss://' . $this->proxyHost() . '/media-stream';
+            $wss = $this->streamUrl();
             // Log call data into storage/logs/laravel.log (or your file)
             Log::info('TWILIO_INCOMING2', [
                 'wss' => $wss,
