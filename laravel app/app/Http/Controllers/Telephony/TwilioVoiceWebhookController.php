@@ -150,13 +150,7 @@ class TwilioVoiceWebhookController extends Controller
             ]);
 
             // Minimal TwiML: attach WS stream
-            $wss   = 'wss://' . $this->proxyHost() . '/media-stream';
-            $query = http_build_query([
-                'call_id'     => $callId,
-                'call_sid'    => $callSid,
-                'tenant_id'   => $tenant->id,
-                'tenant_uuid' => $tenant->uuid,
-            ]);
+            $wss = 'wss://' . $this->proxyHost() . '/media-stream';
             // Log call data into storage/logs/laravel.log (or your file)
             Log::info('TWILIO_INCOMING2', [
                 'wss' => $wss,
@@ -165,7 +159,8 @@ class TwilioVoiceWebhookController extends Controller
             $tenantUuidXml = htmlspecialchars($tenant->uuid ?? '', ENT_QUOTES);
             $callXml       = htmlspecialchars($callSid ?? '', ENT_QUOTES);
             $callIdXml     = htmlspecialchars((string) $callId, ENT_QUOTES);
-            $streamUrl     = 'wss://socket.theurl.co/media-stream';
+            $toNumberXml   = htmlspecialchars($to ?? '', ENT_QUOTES);
+            $streamUrl     = htmlspecialchars($wss, ENT_QUOTES);
             Log::info('TWILIO_INCOMING3', [
                 'streamUrl'     => $streamUrl,
                 'tenantXml'     => $tenantXml,
@@ -183,6 +178,7 @@ class TwilioVoiceWebhookController extends Controller
       <Parameter name="tenant_uuid" value="{$tenantUuidXml}"/>
       <Parameter name="call_sid"  value="{$callXml}"/>
       <Parameter name="call_id"  value="{$callIdXml}"/>
+      <Parameter name="to_number" value="{$toNumberXml}"/>
     </Stream>
   </Start>
   <Pause length="600"/>
