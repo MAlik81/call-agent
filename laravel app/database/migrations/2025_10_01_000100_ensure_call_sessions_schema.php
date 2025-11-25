@@ -107,13 +107,19 @@ return new class extends Migration
             });
         }
 
-        if (Schema::hasColumn('call_sessions', 'call_sid')) {
+        if (
+            Schema::hasColumn('call_sessions', 'call_sid') &&
+            !$this->indexExists('call_sessions', 'call_sessions_call_sid_index')
+        ) {
             Schema::table('call_sessions', function (Blueprint $table) {
                 $table->index('call_sid');
             });
         }
 
-        if (Schema::hasColumns('call_sessions', ['tenant_id', 'started_at'])) {
+        if (
+            Schema::hasColumns('call_sessions', ['tenant_id', 'started_at']) &&
+            !$this->indexExists('call_sessions', 'call_sessions_tenant_id_started_at_index')
+        ) {
             Schema::table('call_sessions', function (Blueprint $table) {
                 $table->index(['tenant_id', 'started_at']);
             });
@@ -126,5 +132,16 @@ return new class extends Migration
     public function down(): void
     {
         // Intentionally left blank to avoid dropping existing data on rollback.
+    }
+
+    private function indexExists(string $table, string $indexName): bool
+    {
+        $connection = Schema::getConnection();
+        $schemaManager = $connection->getDoctrineSchemaManager();
+        $prefixedTableName = $connection->getTablePrefix() . $table;
+
+        $indexes = $schemaManager->listTableIndexes($prefixedTableName);
+
+        return array_key_exists($indexName, $indexes);
     }
 };
