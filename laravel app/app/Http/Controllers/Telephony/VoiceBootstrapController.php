@@ -13,11 +13,6 @@ use Illuminate\Http\Request;
 
 class VoiceBootstrapController extends Controller
 {
-    public function __construct()
-    {
-        $this->middleware('auth:sanctum');
-    }
-
     public function bootstrap(Request $request): JsonResponse
     {
         $validated = $request->validate([

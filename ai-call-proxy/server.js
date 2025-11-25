@@ -32,12 +32,11 @@ function log(level, msg, meta = {}) {
 const {
   PORT = 3000,
   LARAVEL_API_BASE,
-  APP_SHARED_TOKEN,
   OPENAI_API_KEY,
 } = process.env;
 
-if (!LARAVEL_API_BASE || !APP_SHARED_TOKEN) {
-  log('error', 'Missing env: LARAVEL_API_BASE and/or APP_SHARED_TOKEN');
+if (!LARAVEL_API_BASE) {
+  log('error', 'Missing env: LARAVEL_API_BASE');
   process.exit(1);
 }
 
@@ -51,26 +50,18 @@ const wss = new WebSocket.Server({ noServer: true });
  * calls.set(callSid, {
  *   tenantId,
  *   ws,
- *   playing: false,
- *   lastPlayAt: 0,
- *   lastStopAt: 0,
- *   ingestInFlight: false,
- *   ingestQueue: [],
- *   ingestWorkerActive: false,
+ *   bootstrap,
+ *   bootstrapFetched,
+ *   realtime,
+ *   segmentQueue,
+ *   segmentWorkerActive,
+ *   segmentIndexes,
  * })
  */
 const calls = new Map();
 
 // ---------- VAD tuning ----------
 const RMS_ON            = 0.018;   // speech starts above this
-const RMS_OFF           = 0.010;   // speech ends below this
-const SPEECH_ON_FRAMES  = 4;       // ~80ms (4x ~20ms)
-const SPEECH_OFF_FRAMES = 10;      // ~200ms
-const MIN_CHUNK_MS      = 450;     // min voiced duration before accept
-const SILENCE_SECS      = 0.25;    // silence to finalize
-const CHUNK_COOLDOWN_MS = 250;     // min gap between ingests
-const PLAY_LOCK_MS      = 2600;    // debounce play; "playing window"
-const STOP_COOLDOWN_MS  = 500;     // throttle stop spam
 const REALTIME_SAMPLE_RATE = 16000;
 const USER_SEG_SILENCE_MS = 800;   // end user segment after this much silence
 const USER_SEG_MAX_MS = 12000;     // hard stop user segments
@@ -92,29 +83,6 @@ function decodeMulawToPCM16(muBuf) {
     pcm.writeInt16LE(sample, i * 2);
   }
   return pcm;
-}
-
-function pcm16ToWav(pcmBuf, sampleRate = 8000, channels = 1) {
-  const blockAlign = channels * 2;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = pcmBuf.length;
-  const header = Buffer.alloc(44);
-
-  header.write('RIFF', 0);
-  header.writeUInt32LE(36 + dataSize, 4);
-  header.write('WAVE', 8);
-  header.write('fmt ', 12);
-  header.writeUInt32LE(16, 16);  // PCM subchunk size
-  header.writeUInt16LE(1, 20);   // PCM format
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(16, 34);  // bits per sample
-  header.write('data', 36);
-  header.writeUInt32LE(dataSize, 40);
-
-  return Buffer.concat([header, pcmBuf]);
 }
 
 function rmsPcm16(pcmBuf) {
@@ -212,16 +180,9 @@ async function handleMediaStream(ws) {
   // live metrics
   let bytesIn = 0;
   let chunksIn = 0;
-  let turns = 0;
 
-  // per-connection VAD
+  // per-connection flags
   let connActive = true;
-  let state = 'IDLE';
-  let speechOnCount = 0;
-  let speechOffCount = 0;
-  let speechStartedAt = 0;
-  let lastSpeechAt = 0;
-  let hadSpeechSinceFlush = false;
 
   // realtime audio bridging
   let userPcm16Buffers = [];
@@ -231,11 +192,6 @@ async function handleMediaStream(ws) {
   let userSegLastVoiceAt = 0;
   let assistantLastChunkAt = 0;
   let assistantIdleTimer = null;
-
-  // buffers
-  const preRollMu = [];
-  const MAX_PREROLL = 10; // ~200ms (μ-law 8kHz 20ms frames)
-  let captureMu = [];
 
   // per-call shared state
   let callState = null;
@@ -267,13 +223,6 @@ async function handleMediaStream(ws) {
           tenantUuid: tenantUuid || null,
           toNumber: toNumber || null,
           ws: null,
-          playing: false,
-          lastPlayAt: 0,
-          lastStopAt: 0,
-          ingestInFlight: false,
-          ingestQueue: [],
-          ingestWorkerActive: false,
-          lastIngestAt: 0,
           bootstrap: null,
           bootstrapFetched: false,
           realtime: null,
@@ -283,7 +232,6 @@ async function handleMediaStream(ws) {
         };
         calls.set(newKey, callState);
       } else {
-        callState.ingestQueue = callState.ingestQueue || [];
         callState.segmentQueue = callState.segmentQueue || [];
         callState.segmentIndexes = callState.segmentIndexes || { user: 0, assistant: 0 };
       }
@@ -415,7 +363,7 @@ async function handleMediaStream(ws) {
       const resp = await axios.post(
         `${LARAVEL_API_BASE}/api/voice/bootstrap`,
         payload,
-        { headers: { Authorization: `Bearer ${APP_SHARED_TOKEN}` }, timeout: 10000 },
+        { timeout: 10000 },
       );
       state.bootstrap = resp.data;
       log('info', '[BOOTSTRAP] fetched', { callSid, callId: state.callId, tenantId: state.tenantId });
@@ -483,7 +431,7 @@ async function handleMediaStream(ws) {
     }
 
     const durationMs = Date.now() - connOpenedAt;
-    log('info', '[CALL] ended', { callSid, reason, durationMs, errors: errorCount, realtimeErrors: rtErrorCount, chunksIn, bytesIn, turns });
+    log('info', '[CALL] ended', { callSid, reason, durationMs, errors: errorCount, realtimeErrors: rtErrorCount, chunksIn, bytesIn });
   }
 
   function nextSegmentIndex(role = 'user') {
@@ -554,7 +502,7 @@ async function handleMediaStream(ws) {
       },
     };
 
-    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${APP_SHARED_TOKEN}` };
+    const headers = { 'Content-Type': 'application/json' };
 
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
@@ -673,78 +621,6 @@ async function handleMediaStream(ws) {
     return state.realtime;
   }
 
-  async function drainIngestQueue() {
-    if (!callState || callState.ingestWorkerActive) return;
-    callState.ingestWorkerActive = true;
-    callState.ingestQueue = callState.ingestQueue || [];
-    while (callState.ingestQueue.length) {
-      const job = callState.ingestQueue.shift();
-      try {
-        await sendIngestJob(job);
-      } catch (err) {
-        log('error', '[INGEST] queue job failed', { callSid, err: err?.message });
-      }
-    }
-    callState.ingestWorkerActive = false;
-  }
-
-  function enqueueIngestJob(job) {
-    if (!callState) return;
-    callState.ingestQueue = callState.ingestQueue || [];
-    callState.ingestQueue.push(job);
-    callState.lastIngestAt = Date.now();
-    drainIngestQueue();
-  }
-
-  async function sendIngestJob(job = {}) {
-    if (!callState || !job.wavBuf) return;
-    const jobStreamSid = job.streamSid || streamSid;
-    const turnNumber = job.turnNumber || turns;
-    const wavBuf = job.wavBuf;
-
-    const t0 = Date.now();
-    callState.ingestInFlight = true;
-    log('info', '[INGEST] sending', { callSid, turn: turnNumber, wavBytes: wavBuf.length });
-
-    try {
-      const resp = await axios.post(
-        `${LARAVEL_API_BASE}/api/turns/ingest`,
-        {
-          tenant_id: callState.tenantId,
-          call_sid: callSid,
-          encoding: 'audio/wav;rate=8000',
-          audio_b64: wavBuf.toString('base64'),
-          meta: { streamSid: jobStreamSid },
-        },
-        { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${APP_SHARED_TOKEN}` }, timeout: 30000 }
-      );
-      const { ok, audio_url } = resp.data || {};
-      const dt = Date.now() - t0;
-      log('info', '[INGEST] response', { callSid, turn: turnNumber, ok, audio_url, ms: dt });
-
-      const playWindowOk = (Date.now() - callState.lastPlayAt) > PLAY_LOCK_MS;
-      if (ok && audio_url && !callState.playing && playWindowOk) {
-        try {
-          await axios.post(
-            `${LARAVEL_API_BASE}/api/twilio/calls/play`,
-            { tenant_id: callState.tenantId, call_sid: callSid, audio_url },
-            { headers: { Authorization: `Bearer ${APP_SHARED_TOKEN}` }, timeout: 8000 }
-          );
-          callState.playing = true;
-          callState.lastPlayAt = Date.now();
-          log('info', '[PLAY] requested', { callSid, audio_url });
-          setTimeout(() => { callState.playing = false; }, PLAY_LOCK_MS);
-        } catch (e) {
-          log('warn', '[PLAY] request failed (ignored)', { callSid, err: e?.response?.data || e.message });
-        }
-      }
-    } catch (e) {
-      log('error', '[INGEST] error', { callSid, err: e?.response?.data || e.message });
-    } finally {
-      callState.ingestInFlight = false;
-    }
-  }
-
   ws.on('message', async (raw) => {
     let data;
     try { data = JSON.parse(raw.toString()); }
@@ -799,12 +675,6 @@ async function handleMediaStream(ws) {
       // realtime streaming + segment buffer for user
       appendAudioToRealtime(pcm16);
 
-      // pre-roll
-      preRollMu.push(mu);
-      if (preRollMu.length > MAX_PREROLL) preRollMu.shift();
-
-      // energy
-      const energy = rmsPcm16(pcm8);
       const segEnergy = rmsPcm16(pcm16);
       const now = Date.now();
 
@@ -825,80 +695,6 @@ async function handleMediaStream(ws) {
         finalizeUserSegment('silence');
       } else if (userPcm16Buffers.length && segDuration >= USER_SEG_MAX_MS) {
         finalizeUserSegment('timeout');
-      }
-
-      // hysteresis counters
-      if (energy >= RMS_ON) {
-        speechOnCount++;
-        speechOffCount = 0;
-      } else if (energy <= RMS_OFF) {
-        speechOffCount++;
-        if (speechOnCount > 0) speechOnCount--;
-      } else {
-        if (speechOnCount > 0) speechOnCount--;
-      }
-
-      // barge-in
-      if (callState.playing && speechOnCount >= SPEECH_ON_FRAMES && (now - callState.lastStopAt) > STOP_COOLDOWN_MS) {
-        try {
-          await axios.post(
-            `${LARAVEL_API_BASE}/api/twilio/calls/stop`,
-            { tenant_id: callState.tenantId, call_sid: callSid },
-            { headers: { Authorization: `Bearer ${APP_SHARED_TOKEN}` }, timeout: 5000 }
-          );
-          callState.lastStopAt = now;
-          callState.playing = false;
-
-          state = 'SPEAKING';
-          hadSpeechSinceFlush = true;
-          speechStartedAt = lastSpeechAt = now;
-          captureMu = preRollMu.slice();
-          log('info', '[WS] barge-in: requested stop', { callSid });
-        } catch (_) { /* ignore */ }
-        return;
-      }
-
-      // VAD state machine
-      if (state === 'IDLE') {
-        if (speechOnCount >= SPEECH_ON_FRAMES && !callState.playing) {
-          state = 'SPEAKING';
-          hadSpeechSinceFlush = true;
-          speechStartedAt = lastSpeechAt = now;
-          captureMu = preRollMu.slice();
-          log('info', '[VAD] speaking start', { callSid });
-        }
-      } else if (state === 'SPEAKING') {
-        captureMu.push(mu);
-        if (energy >= RMS_ON) lastSpeechAt = now;
-
-        const speakingMs = now - speechStartedAt;
-        const silentForS = (now - lastSpeechAt) / 1000;
-
-        if (hadSpeechSinceFlush &&
-            speakingMs >= MIN_CHUNK_MS &&
-            speechOffCount >= SPEECH_OFF_FRAMES &&
-            silentForS >= SILENCE_SECS &&
-            (now - callState.lastIngestAt) >= CHUNK_COOLDOWN_MS) {
-
-          log('info', '[VAD] speaking end', { callSid, speakingMs, capturedFrames: captureMu.length });
-
-          // build WAV from μ-law frames
-          const pcmFrames = captureMu.map(decodeMulawToPCM16);
-          const pcmBuf = Buffer.concat(pcmFrames);
-          const wavBuf = pcm16ToWav(pcmBuf, 8000, 1);
-
-          // reset for next turn
-          captureMu = [];
-          hadSpeechSinceFlush = false;
-          state = 'IDLE';
-          speechOnCount = 0;
-          speechOffCount = 0;
-          speechStartedAt = 0;
-          lastSpeechAt = 0;
-
-          turns++;
-          enqueueIngestJob({ wavBuf, streamSid, turnNumber: turns });
-        }
       }
       return;
     }

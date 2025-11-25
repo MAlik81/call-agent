@@ -18,7 +18,7 @@ Route::post('/turns/ingest', [TurnIngestController::class, 'ingest']);
 
 Route::get('/ws-health', [TurnIngestController::class, 'wsHealth']);
 
-Route::middleware('auth:sanctum')->post('/voice/bootstrap', [VoiceBootstrapController::class, 'bootstrap']);
+Route::post('/voice/bootstrap', [VoiceBootstrapController::class, 'bootstrap']);
 
 Route::post('/cron/process-call-segments', [CronController::class, 'processCallSegments']);
 
