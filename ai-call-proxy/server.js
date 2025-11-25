@@ -71,6 +71,11 @@ const SILENCE_SECS      = 0.25;    // silence to finalize
 const CHUNK_COOLDOWN_MS = 250;     // min gap between ingests
 const PLAY_LOCK_MS      = 2600;    // debounce play; "playing window"
 const STOP_COOLDOWN_MS  = 500;     // throttle stop spam
+const REALTIME_SAMPLE_RATE = 16000;
+const USER_SEG_SILENCE_MS = 800;   // end user segment after this much silence
+const USER_SEG_MAX_MS = 12000;     // hard stop user segments
+const ASSISTANT_SEG_IDLE_MS = 1200; // end assistant segment if idle
+const ASSISTANT_SEG_MAX_MS = 15000; // hard stop assistant segments
 
 // ---------- audio utils: μ-law -> PCM16, WAV, RMS ----------
 function decodeMulawToPCM16(muBuf) {
@@ -123,6 +128,44 @@ function rmsPcm16(pcmBuf) {
   return Math.sqrt(sum / samples) / 32768;
 }
 
+function resamplePcm16(pcmBuf, fromRate, toRate) {
+  if (!pcmBuf || fromRate === toRate) return pcmBuf;
+
+  const fromSamples = pcmBuf.length / 2;
+  const toSamples = Math.max(1, Math.round(fromSamples * toRate / fromRate));
+  const out = Buffer.alloc(toSamples * 2);
+  const ratio = fromSamples / toSamples;
+
+  for (let i = 0; i < toSamples; i++) {
+    const pos = i * ratio;
+    const base = Math.floor(pos);
+    const frac = pos - base;
+    const s1 = pcmBuf.readInt16LE(Math.min(base, fromSamples - 1) * 2);
+    const s2 = pcmBuf.readInt16LE(Math.min(base + 1, fromSamples - 1) * 2);
+    const sample = Math.round(s1 + (s2 - s1) * frac);
+    out.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), i * 2);
+  }
+
+  return out;
+}
+
+function encodePCM16ToMulaw(pcmBuf) {
+  const mu = Buffer.alloc(pcmBuf.length / 2);
+  for (let i = 0; i < pcmBuf.length; i += 2) {
+    let sample = pcmBuf.readInt16LE(i);
+    const sign = sample < 0 ? 0x80 : 0;
+    if (sample < 0) sample = -sample;
+    if (sample > 32635) sample = 32635;
+
+    sample += 0x84; // bias
+    const exponent = Math.floor(Math.log(sample) / Math.log(2)) - 7;
+    const mantissa = (sample >> (exponent + 3)) & 0x0f;
+    const uval = ~(sign | (exponent << 4) | mantissa) & 0xff;
+    mu[i / 2] = uval;
+  }
+  return mu;
+}
+
 // ---------- routes ----------
 app.get('/', (_req, res) => res.send('<h1>AI Call Proxy — WS up</h1>'));
 app.get('/ws-status', (_req, res) => {
@@ -173,6 +216,15 @@ async function handleMediaStream(ws) {
   let speechStartedAt = 0;
   let lastSpeechAt = 0;
   let hadSpeechSinceFlush = false;
+
+  // realtime audio bridging
+  let userPcm16Buffers = [];
+  let assistantPcm16Buffers = [];
+  let userSegmentStartedAt = 0;
+  let assistantSegmentStartedAt = 0;
+  let userSegLastVoiceAt = 0;
+  let assistantLastChunkAt = 0;
+  let assistantIdleTimer = null;
 
   // buffers
   const preRollMu = [];
@@ -234,6 +286,65 @@ async function handleMediaStream(ws) {
     callState.toNumber = toNumber || callState.toNumber || null;
 
     return callState;
+  }
+
+  function appendAudioToRealtime(pcm16) {
+    const rt = callState?.realtime;
+    if (!rt?.ready || rt.ws?.readyState !== WebSocket.OPEN) return;
+    try {
+      rt.ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: pcm16.toString('base64') }));
+    } catch (err) {
+      log('error', '[REALTIME] append failed', { callSid, err: err?.message });
+    }
+  }
+
+  function sendAudioToTwilio(muBuf) {
+    const tws = callState?.ws || ws;
+    if (!tws || tws.readyState !== WebSocket.OPEN || !streamSid) return;
+    const payload = { event: 'media', streamSid, media: { payload: muBuf.toString('base64') } };
+    try { tws.send(JSON.stringify(payload)); }
+    catch (err) { log('error', '[TWILIO] send failed', { callSid, err: err?.message }); }
+  }
+
+  function resetAssistantIdleTimer() {
+    if (assistantIdleTimer) clearTimeout(assistantIdleTimer);
+    if (!assistantPcm16Buffers.length) return;
+    assistantIdleTimer = setTimeout(() => finalizeAssistantSegment('silence'), ASSISTANT_SEG_IDLE_MS);
+  }
+
+  function finalizeAssistantSegment(reason = 'complete') {
+    if (assistantIdleTimer) {
+      clearTimeout(assistantIdleTimer);
+      assistantIdleTimer = null;
+    }
+    if (!assistantPcm16Buffers.length) return;
+    const pcmBuf = Buffer.concat(assistantPcm16Buffers);
+    const ms = assistantSegmentStartedAt ? (Date.now() - assistantSegmentStartedAt) : 0;
+    const lastDeltaAgo = assistantLastChunkAt ? (Date.now() - assistantLastChunkAt) : 0;
+    assistantPcm16Buffers = [];
+    assistantSegmentStartedAt = 0;
+    assistantLastChunkAt = 0;
+    log('info', '[SEGMENT] assistant finalized', { callSid, reason, ms, lastDeltaAgo, samples: pcmBuf.length / 2 });
+  }
+
+  function finalizeUserSegment(reason = 'silence') {
+    if (!userPcm16Buffers.length) return;
+    const pcmBuf = Buffer.concat(userPcm16Buffers);
+    const ms = userSegmentStartedAt ? (Date.now() - userSegmentStartedAt) : 0;
+    userPcm16Buffers = [];
+    userSegmentStartedAt = 0;
+    userSegLastVoiceAt = 0;
+
+    const rt = callState?.realtime;
+    if (rt?.ready && rt.ws?.readyState === WebSocket.OPEN) {
+      try { rt.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); }
+      catch (err) { log('error', '[REALTIME] commit failed', { callSid, err: err?.message }); }
+
+      try { rt.ws.send(JSON.stringify({ type: 'response.create', response: { modalities: ['text', 'audio'] } })); }
+      catch (err) { log('error', '[REALTIME] response.create failed', { callSid, err: err?.message }); }
+    }
+
+    log('info', '[SEGMENT] user finalized', { callSid, reason, ms, samples: pcmBuf.length / 2 });
   }
 
   async function fetchBootstrapConfig() {
@@ -330,8 +441,10 @@ async function handleMediaStream(ws) {
           model,
           voice: config.realtime_voice || undefined,
           language: config.realtime_language || undefined,
-          input_audio_format: 'g711_ulaw',
-          output_audio_format: 'g711_ulaw',
+          input_audio_format: 'pcm16',
+          input_audio_sample_rate: REALTIME_SAMPLE_RATE,
+          output_audio_format: 'pcm16',
+          output_audio_sample_rate: REALTIME_SAMPLE_RATE,
           input_audio_transcription: { enabled: true },
           modalities: ['text', 'audio'],
           instructions,
@@ -347,12 +460,47 @@ async function handleMediaStream(ws) {
     });
 
     rtWs.on('message', (msg) => {
+      let evt;
+      try { evt = JSON.parse(msg.toString()); }
+      catch (err) { return log('warn', '[REALTIME] parse error', { callSid, err: err?.message }); }
+
       if (LOG_LEVEL >= LOG_LEVELS.debug) {
-        log('debug', '[REALTIME] message', { callSid, bytes: msg?.length || 0 });
+        log('debug', '[REALTIME] message', { callSid, type: evt?.type, bytes: msg?.length || 0 });
+      }
+
+      if (evt?.type === 'response.audio.delta' || evt?.type === 'response.output_audio.delta' || evt?.type === 'response.output_audio.buffer.append') {
+        const base64 = evt.delta || evt.audio || evt.output_audio || evt.output_audio_delta || evt.data || evt.output_audio?.data;
+        if (!base64) return log('warn', '[REALTIME] missing audio delta payload', { callSid, type: evt?.type });
+
+        const pcm16 = Buffer.from(base64, 'base64');
+        assistantPcm16Buffers.push(pcm16);
+        const now = Date.now();
+        assistantLastChunkAt = now;
+        if (!assistantSegmentStartedAt) assistantSegmentStartedAt = now;
+
+        const pcm8 = resamplePcm16(pcm16, REALTIME_SAMPLE_RATE, 8000);
+        const mu = encodePCM16ToMulaw(pcm8);
+        sendAudioToTwilio(mu);
+        resetAssistantIdleTimer();
+
+        if (assistantSegmentStartedAt && (now - assistantSegmentStartedAt) >= ASSISTANT_SEG_MAX_MS) {
+          finalizeAssistantSegment('assistant-max');
+        }
+        return;
+      }
+
+      if (evt?.type === 'response.completed' || evt?.type === 'response.output_audio.stopped' || evt?.type === 'response.audio.stopped') {
+        finalizeAssistantSegment('realtime-complete');
+        return;
+      }
+
+      if (evt?.type === 'error') {
+        log('error', '[REALTIME] event error', { callSid, err: evt?.error || evt?.message || evt });
       }
     });
 
     rtWs.on('close', () => {
+      finalizeAssistantSegment('realtime-close');
       log('info', '[REALTIME] session closed', { callSid });
       closeRealtime(state);
     });
@@ -477,19 +625,44 @@ async function handleMediaStream(ws) {
 
       // μ-law frame
       const mu = Buffer.from(data.media.payload, 'base64');
+      const pcm8 = decodeMulawToPCM16(mu);
+      const pcm16 = resamplePcm16(pcm8, 8000, REALTIME_SAMPLE_RATE);
       chunksIn++;
       bytesIn += mu.length;
       if (LOG_LEVEL >= LOG_LEVELS.debug && (++_frameCounter % LOG_FRAME_EVERY) === 0) {
         log('debug', '[WS] media frame', { callSid, chunk: chunksIn, muBytes: mu.length });
       }
 
+      // realtime streaming + segment buffer for user
+      appendAudioToRealtime(pcm16);
+
       // pre-roll
       preRollMu.push(mu);
       if (preRollMu.length > MAX_PREROLL) preRollMu.shift();
 
       // energy
-      const energy = rmsPcm16(decodeMulawToPCM16(mu));
+      const energy = rmsPcm16(pcm8);
+      const segEnergy = rmsPcm16(pcm16);
       const now = Date.now();
+
+      let bufferThisFrame = false;
+      if (segEnergy >= RMS_ON) {
+        if (!userSegmentStartedAt) userSegmentStartedAt = now;
+        userSegLastVoiceAt = now;
+        bufferThisFrame = true;
+      } else if (userSegmentStartedAt) {
+        bufferThisFrame = true;
+      }
+
+      if (bufferThisFrame) userPcm16Buffers.push(pcm16);
+
+      const segDuration = userSegmentStartedAt ? (now - userSegmentStartedAt) : 0;
+      const segSilence = userSegLastVoiceAt ? (now - userSegLastVoiceAt) : 0;
+      if (userPcm16Buffers.length && userSegLastVoiceAt && segSilence >= USER_SEG_SILENCE_MS) {
+        finalizeUserSegment('silence');
+      } else if (userPcm16Buffers.length && segDuration >= USER_SEG_MAX_MS) {
+        finalizeUserSegment('timeout');
+      }
 
       // hysteresis counters
       if (energy >= RMS_ON) {
@@ -569,6 +742,8 @@ async function handleMediaStream(ws) {
 
     if (data.event === 'stop') {
       connActive = false;
+      finalizeUserSegment('twilio-stop');
+      finalizeAssistantSegment('twilio-stop');
       try { ws.close(); } catch {}
       log('info', '[WS] stop received', { callSid });
       return;
@@ -577,6 +752,8 @@ async function handleMediaStream(ws) {
 
   ws.on('close', () => {
     connActive = false;
+    finalizeUserSegment('socket-close');
+    finalizeAssistantSegment('socket-close');
     const key = getCallKey();
     if (key && calls.get(key)?.ws === ws) {
       calls.get(key).ws = null;
