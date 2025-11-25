@@ -125,17 +125,20 @@ function rmsPcm16(pcmBuf) {
 // ---------- routes ----------
 app.get('/', (_req, res) => res.send('<h1>AI Call Proxy — WS up</h1>'));
 app.get('/ws-status', (_req, res) => {
-  log('info', '[STATUS] ws-status check',LARAVEL_API_BASE);
+  log('info', '[STATUS] ws-status check', { LARAVEL_API_BASE });
   const wsRunning = !!wss && typeof wss.handleUpgrade === 'function';
   const activeCalls = Array.from(calls.values()).filter(c => c.ws !== null).length;
-  res.json({ ws_server_running: wsRunning, ws_active_calls: activeCalls, LARAVEL_API_BASE:LARAVEL_API_BASE });
+  res.json({ ws_server_running: wsRunning, ws_active_calls: activeCalls, LARAVEL_API_BASE });
 });
 
 // ---------- upgrade -> ws ----------
 server.on('upgrade', (request, socket, head) => {
   const { pathname, query } = url.parse(request.url, true);
   log('info', '[UPGRADE] request', { pathname, query });
-  if (pathname === '/media-stream') {
+
+  const isMediaPath = pathname === '/media-stream' || pathname === '/twilio-media';
+
+  if (isMediaPath) {
     wss.handleUpgrade(request, socket, head, (ws) => {
       ws.params = query;
       handleMediaStream(ws);
@@ -149,8 +152,12 @@ server.on('upgrade', (request, socket, head) => {
 // ---------- core WS handler ----------
 async function handleMediaStream(ws) {
   let streamSid = null;
-  let callSid = null;
-  let tenantId = 'unknown-tenant';
+  let callSid = ws.params?.call_sid || null;
+  let callId = Number.parseInt(ws.params?.call_id, 10);
+  callId = Number.isFinite(callId) ? callId : null;
+  let tenantId = ws.params?.tenant_id || 'unknown-tenant';
+  let tenantUuid = ws.params?.tenant_uuid || null;
+  let toNumber = ws.params?.to_number || ws.params?.to || ws.params?.Called || null;
 
   // live metrics
   let bytesIn = 0;
@@ -173,6 +180,89 @@ async function handleMediaStream(ws) {
 
   // per-call shared state
   let callState = null;
+  let callKey = null;
+
+  function getCallKey() {
+    if (callSid) return callSid;
+    if (callId) return `call-${callId}`;
+    return null;
+  }
+
+  function ensureCallState() {
+    const newKey = getCallKey();
+    if (!newKey) return null;
+
+    if (callState && callKey && callKey !== newKey) {
+      calls.delete(callKey);
+      calls.set(newKey, callState);
+      callKey = newKey;
+    }
+
+    if (!callState) {
+      callState = calls.get(newKey);
+      if (!callState) {
+        callState = {
+          callId: callId || null,
+          callSid: callSid || null,
+          tenantId: tenantId || 'unknown-tenant',
+          tenantUuid: tenantUuid || null,
+          toNumber: toNumber || null,
+          ws: null,
+          playing: false,
+          lastPlayAt: 0,
+          lastStopAt: 0,
+          ingestInFlight: false,
+          ingestQueue: [],
+          ingestWorkerActive: false,
+          lastIngestAt: 0,
+          bootstrap: null,
+          bootstrapFetched: false,
+        };
+        calls.set(newKey, callState);
+      } else {
+        callState.ingestQueue = callState.ingestQueue || [];
+      }
+      callKey = newKey;
+    }
+
+    callState.callSid = callSid || callState.callSid;
+    callState.callId = callId || callState.callId;
+    callState.tenantId = tenantId || callState.tenantId || 'unknown-tenant';
+    callState.tenantUuid = tenantUuid || callState.tenantUuid || null;
+    callState.toNumber = toNumber || callState.toNumber || null;
+
+    return callState;
+  }
+
+  async function fetchBootstrapConfig() {
+    const state = ensureCallState();
+    if (!state || state.bootstrapFetched) return state?.bootstrap || null;
+
+    state.bootstrapFetched = true;
+
+    const payload = {};
+    if (state.callId) payload.call_id = state.callId;
+    if (state.toNumber) payload.to_number = state.toNumber;
+
+    if (!payload.call_id && !payload.to_number) {
+      log('warn', '[BOOTSTRAP] skipped: missing call_id and to_number', { callSid });
+      return null;
+    }
+
+    try {
+      const resp = await axios.post(
+        `${LARAVEL_API_BASE}/api/voice/bootstrap`,
+        payload,
+        { headers: { Authorization: `Bearer ${APP_SHARED_TOKEN}` }, timeout: 10000 },
+      );
+      state.bootstrap = resp.data;
+      log('info', '[BOOTSTRAP] fetched', { callSid, callId: state.callId, tenantId: state.tenantId });
+    } catch (err) {
+      log('error', '[BOOTSTRAP] failed', { callSid, err: err?.response?.data || err.message });
+    }
+
+    return state.bootstrap;
+  }
 
   async function drainIngestQueue() {
     if (!callState || callState.ingestWorkerActive) return;
@@ -253,40 +343,31 @@ async function handleMediaStream(ws) {
 
     if (data.event === 'start') {
       streamSid = data.start.streamSid;
-      callSid   = data.start.callSid || ws.params?.call_sid || '(unknown)';
+      callSid   = data.start.callSid || ws.params?.call_sid || callSid;
 
       const cp = data.start.customParameters;
       if (Array.isArray(cp)) {
-        for (const item of cp) if (item?.name === 'tenant_id') tenantId = item.value;
-      } else if (cp && typeof cp === 'object' && cp.tenant_id) {
-        tenantId = cp.tenant_id;
+        for (const item of cp) {
+          if (item?.name === 'tenant_id') tenantId = item.value;
+          if (item?.name === 'call_id') callId = Number.parseInt(item.value, 10) || callId;
+          if (item?.name === 'to_number') toNumber = item.value || toNumber;
+        }
+      } else if (cp && typeof cp === 'object') {
+        tenantId = cp.tenant_id || tenantId;
+        callId = Number.parseInt(cp.call_id, 10) || callId;
+        toNumber = cp.to_number || toNumber;
       }
 
-      // per-call dedupe
-      callState = calls.get(callSid);
-      if (!callState) {
-        callState = {
-          tenantId,
-          ws: null,
-          playing: false,
-          lastPlayAt: 0,
-          lastStopAt: 0,
-          ingestInFlight: false,
-          ingestQueue: [],
-          ingestWorkerActive: false,
-          lastIngestAt: 0,
-        };
-        calls.set(callSid, callState);
-      } else {
-        callState.tenantId = tenantId;
+      ensureCallState();
+      if (callState) {
         if (callState.ws && callState.ws !== ws) {
           try { callState.ws.close(); } catch {}
         }
-        callState.ingestQueue = callState.ingestQueue || [];
+        callState.ws = ws;
       }
-      callState.ws = ws;
 
-      log('info', '[WS] start', { streamSid, callSid, tenantId });
+      log('info', '[WS] start', { streamSid, callSid, tenantId, callId, toNumber });
+      await fetchBootstrapConfig();
       return;
     }
 
@@ -395,8 +476,9 @@ async function handleMediaStream(ws) {
 
   ws.on('close', () => {
     connActive = false;
-    if (callSid && calls.get(callSid)?.ws === ws) {
-      calls.get(callSid).ws = null;
+    const key = getCallKey();
+    if (key && calls.get(key)?.ws === ws) {
+      calls.get(key).ws = null;
     }
     log('info', '[WS] closed', { callSid, chunksIn, bytesIn, turns });
   });
