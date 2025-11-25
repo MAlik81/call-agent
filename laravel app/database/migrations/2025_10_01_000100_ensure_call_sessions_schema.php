@@ -41,62 +41,62 @@ return new class extends Migration
         }
 
         Schema::table('call_sessions', function (Blueprint $table) {
-            if (!Schema::hasColumn('call_sessions', 'tenant_id')) {
+            if (!$this->columnExists('call_sessions', 'tenant_id')) {
                 $table->unsignedBigInteger('tenant_id')->nullable()->after('id');
             }
 
-            if (!Schema::hasColumn('call_sessions', 'call_sid')) {
+            if (!$this->columnExists('call_sessions', 'call_sid')) {
                 $table->string('call_sid', 64)->after('tenant_id');
             }
 
-            if (!Schema::hasColumn('call_sessions', 'from_number')) {
+            if (!$this->columnExists('call_sessions', 'from_number')) {
                 $table->string('from_number', 32)->nullable();
             }
 
-            if (!Schema::hasColumn('call_sessions', 'to_number')) {
+            if (!$this->columnExists('call_sessions', 'to_number')) {
                 $table->string('to_number', 32)->nullable();
             }
 
-            if (!Schema::hasColumn('call_sessions', 'status')) {
+            if (!$this->columnExists('call_sessions', 'status')) {
                 $table->enum('status', ['initiated', 'active', 'completed', 'failed'])->default('initiated');
             }
 
-            if (!Schema::hasColumn('call_sessions', 'direction')) {
+            if (!$this->columnExists('call_sessions', 'direction')) {
                 $table->enum('direction', ['inbound', 'outbound'])->default('inbound');
             }
 
-            if (!Schema::hasColumn('call_sessions', 'assistant_thread_id')) {
+            if (!$this->columnExists('call_sessions', 'assistant_thread_id')) {
                 $table->string('assistant_thread_id', 128)->nullable();
             }
 
-            if (!Schema::hasColumn('call_sessions', 'started_at')) {
+            if (!$this->columnExists('call_sessions', 'started_at')) {
                 $table->dateTime('started_at')->nullable();
             }
 
-            if (!Schema::hasColumn('call_sessions', 'ended_at')) {
+            if (!$this->columnExists('call_sessions', 'ended_at')) {
                 $table->dateTime('ended_at')->nullable();
             }
 
-            if (!Schema::hasColumn('call_sessions', 'twilio_billable_sec')) {
+            if (!$this->columnExists('call_sessions', 'twilio_billable_sec')) {
                 $table->integer('twilio_billable_sec')->default(0);
             }
 
-            if (!Schema::hasColumn('call_sessions', 'hangup_cause')) {
+            if (!$this->columnExists('call_sessions', 'hangup_cause')) {
                 $table->string('hangup_cause', 64)->nullable();
             }
 
-            if (!Schema::hasColumn('call_sessions', 'meta')) {
+            if (!$this->columnExists('call_sessions', 'meta')) {
                 $table->json('meta')->nullable();
             }
 
-            if (!Schema::hasColumns('call_sessions', ['created_at', 'updated_at'])) {
+            if (!$this->columnsExist('call_sessions', ['created_at', 'updated_at'])) {
                 $table->timestamps();
             }
         });
 
-        if (Schema::hasTable('tenants') && Schema::hasColumn('call_sessions', 'tenant_id')) {
+        if (Schema::hasTable('tenants') && $this->columnExists('call_sessions', 'tenant_id')) {
             Schema::table('call_sessions', function (Blueprint $table) {
-                if (!Schema::hasColumn('call_sessions', 'tenant_id')) {
+                if (!$this->columnExists('call_sessions', 'tenant_id')) {
                     return;
                 }
 
@@ -108,7 +108,7 @@ return new class extends Migration
         }
 
         if (
-            Schema::hasColumn('call_sessions', 'call_sid') &&
+            $this->columnExists('call_sessions', 'call_sid') &&
             !$this->indexExists('call_sessions', 'call_sessions_call_sid_index')
         ) {
             Schema::table('call_sessions', function (Blueprint $table) {
@@ -117,7 +117,7 @@ return new class extends Migration
         }
 
         if (
-            Schema::hasColumns('call_sessions', ['tenant_id', 'started_at']) &&
+            $this->columnsExist('call_sessions', ['tenant_id', 'started_at']) &&
             !$this->indexExists('call_sessions', 'call_sessions_tenant_id_started_at_index')
         ) {
             Schema::table('call_sessions', function (Blueprint $table) {
@@ -146,5 +146,30 @@ return new class extends Migration
         );
 
         return !empty($indexes) && (int) $indexes[0]->count > 0;
+    }
+
+    private function columnExists(string $table, string $column): bool
+    {
+        $connection = Schema::getConnection();
+        $databaseName = $connection->getDatabaseName();
+        $prefixedTableName = $connection->getTablePrefix() . $table;
+
+        $result = $connection->selectOne(
+            'SELECT COUNT(1) as count FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?',
+            [$databaseName, $prefixedTableName, $column]
+        );
+
+        return $result !== null && (int) $result->count > 0;
+    }
+
+    private function columnsExist(string $table, array $columns): bool
+    {
+        foreach ($columns as $column) {
+            if (!$this->columnExists($table, $column)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 };
