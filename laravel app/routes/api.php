@@ -9,6 +9,7 @@ use App\Http\Controllers\Turns\TurnIngestController; // from prev step
 use App\Http\Controllers\Telephony\TwilioVoiceWebhookController;
 use App\Http\Controllers\Telephony\VoiceBootstrapController;
 use App\Http\Controllers\CallSegmentController;
+use App\Http\Controllers\Cron\CronController;
 
 
 
@@ -18,6 +19,8 @@ Route::post('/turns/ingest', [TurnIngestController::class, 'ingest']);
 Route::get('/ws-health', [TurnIngestController::class, 'wsHealth']);
 
 Route::middleware('auth:sanctum')->post('/voice/bootstrap', [VoiceBootstrapController::class, 'bootstrap']);
+
+Route::post('/cron/process-call-segments', [CronController::class, 'processCallSegments']);
 
 
 // new
