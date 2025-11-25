@@ -252,6 +252,7 @@ async function handleMediaStream(ws) {
     if (!rt?.ready || rt.ws?.readyState !== WebSocket.OPEN) return;
     try {
       rt.ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: pcm16.toString('base64') }));
+      rt.inputSamplesBuffered = (rt.inputSamplesBuffered || 0) + (pcm16.length / 2);
     } catch (err) {
       log('error', '[REALTIME] append failed', { callSid, err: err?.message });
     }
@@ -332,10 +333,15 @@ async function handleMediaStream(ws) {
 
     const rt = callState?.realtime;
     if (rt?.ready && rt.ws?.readyState === WebSocket.OPEN) {
-      try { rt.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); }
-      catch (err) { log('error', '[REALTIME] commit failed', { callSid, err: err?.message }); }
+      if (rt.inputSamplesBuffered && rt.inputSamplesBuffered > 0) {
+        try { rt.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); }
+        catch (err) { log('error', '[REALTIME] commit failed', { callSid, err: err?.message }); }
+        rt.inputSamplesBuffered = 0;
+      } else {
+        log('warn', '[REALTIME] skip commit: empty audio buffer', { callSid });
+      }
 
-      try { rt.ws.send(JSON.stringify({ type: 'response.create', response: { modalities: ['text', 'audio'] } })); }
+      try { rt.ws.send(JSON.stringify({ type: 'response.create' })); }
       catch (err) { log('error', '[REALTIME] response.create failed', { callSid, err: err?.message }); }
     }
 
@@ -504,6 +510,13 @@ async function handleMediaStream(ws) {
 
     const headers = { 'Content-Type': 'application/json' };
 
+    const isDuplicateError = (err) => {
+      const status = err?.response?.status;
+      const msg = (err?.response?.data?.message || err?.response?.data || err?.message || '').toString();
+      if (status === 409) return true;
+      return msg.includes('Duplicate entry') || msg.includes('call_segments_call_session_id_segment_index_unique');
+    };
+
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         await axios.post(url, payload, { headers, timeout: 10000 });
@@ -512,6 +525,10 @@ async function handleMediaStream(ws) {
       } catch (err) {
         const errData = err?.response?.data || err.message;
         log('warn', '[SEGMENT] post failed', { callSid, role: job.role, idx: job.segmentIndex, attempt, format, sampleRate, audioBytes: audioB64.length, err: errData });
+        if (isDuplicateError(err)) {
+          log('warn', '[SEGMENT] duplicate index, skipping retries', { callSid, role: job.role, idx: job.segmentIndex });
+          return;
+        }
         if (attempt < 3) await new Promise((res) => setTimeout(res, attempt * 500));
       }
     }
@@ -539,7 +556,7 @@ async function handleMediaStream(ws) {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
 
-    state.realtime = { ws: rtWs, ready: false, keepAlive: null };
+    state.realtime = { ws: rtWs, ready: false, keepAlive: null, inputSamplesBuffered: 0 };
 
     rtWs.on('open', () => {
       const instructions = buildRealtimeInstructions(config);
