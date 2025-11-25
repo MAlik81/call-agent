@@ -19,7 +19,6 @@ class SpeechToTextService
 
         $start = microtime(true);
         $response = Http::withToken($apiKey)
-            ->withOptions(['verify' => false])
             ->attach('file', $audioBinary, $filename)
             ->asMultipart()
             ->post('https://api.openai.com/v1/audio/transcriptions', [
