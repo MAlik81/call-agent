@@ -203,6 +203,12 @@ async function handleMediaStream(ws) {
   let tenantUuid = ws.params?.tenant_uuid || null;
   let toNumber = ws.params?.to_number || ws.params?.to || ws.params?.Called || null;
 
+  // lifecycle
+  let connOpenedAt = Date.now();
+  let callEnded = false;
+  let errorCount = 0;
+  let rtErrorCount = 0;
+
   // live metrics
   let bytesIn = 0;
   let chunksIn = 0;
@@ -408,7 +414,10 @@ async function handleMediaStream(ws) {
       state.bootstrap = resp.data;
       log('info', '[BOOTSTRAP] fetched', { callSid, callId: state.callId, tenantId: state.tenantId });
     } catch (err) {
-      log('error', '[BOOTSTRAP] failed', { callSid, err: err?.response?.data || err.message });
+      const errMeta = err?.response?.data || err.message;
+      log('error', '[BOOTSTRAP] failed', { callSid, err: errMeta });
+      state.bootstrap = state.bootstrap || { config: { realtime_enabled: true } };
+      log('warn', '[BOOTSTRAP] continuing with realtime bridge only', { callSid, err: errMeta });
     }
 
     return state.bootstrap;
@@ -447,6 +456,28 @@ async function handleMediaStream(ws) {
     }
     state.realtime.ws = null;
     state.realtime.ready = false;
+  }
+
+  function endCall(reason = 'unknown') {
+    if (callEnded) return;
+    callEnded = true;
+    connActive = false;
+
+    finalizeUserSegment(reason);
+    finalizeAssistantSegment(reason);
+    closeRealtime(callState);
+
+    const key = getCallKey();
+    if (key && calls.get(key)?.ws === ws) {
+      calls.get(key).ws = null;
+    }
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.close(); } catch {}
+    }
+
+    const durationMs = Date.now() - connOpenedAt;
+    log('info', '[CALL] ended', { callSid, reason, durationMs, errors: errorCount, realtimeErrors: rtErrorCount, chunksIn, bytesIn, turns });
   }
 
   function nextSegmentIndex(role = 'user') {
@@ -603,18 +634,22 @@ async function handleMediaStream(ws) {
       }
 
       if (evt?.type === 'error') {
+        rtErrorCount++;
         log('error', '[REALTIME] event error', { callSid, err: evt?.error || evt?.message || evt });
       }
     });
 
     rtWs.on('close', () => {
-      finalizeAssistantSegment('realtime-close');
-      log('info', '[REALTIME] session closed', { callSid });
-      closeRealtime(state);
+      if (!callEnded) {
+        log('info', '[REALTIME] session closed', { callSid });
+        endCall('realtime-close');
+      }
     });
 
     rtWs.on('error', (err) => {
+      rtErrorCount++;
       log('error', '[REALTIME] socket error', { callSid, err: err?.message });
+      endCall('realtime-error');
     });
 
     return state.realtime;
@@ -849,28 +884,18 @@ async function handleMediaStream(ws) {
     }
 
     if (data.event === 'stop') {
-      connActive = false;
-      finalizeUserSegment('twilio-stop');
-      finalizeAssistantSegment('twilio-stop');
-      try { ws.close(); } catch {}
       log('info', '[WS] stop received', { callSid });
+      endCall('twilio-stop');
       return;
     }
   });
 
   ws.on('close', () => {
-    connActive = false;
-    finalizeUserSegment('socket-close');
-    finalizeAssistantSegment('socket-close');
-    const key = getCallKey();
-    if (key && calls.get(key)?.ws === ws) {
-      calls.get(key).ws = null;
-    }
-    closeRealtime(callState);
-    log('info', '[WS] closed', { callSid, chunksIn, bytesIn, turns });
+    endCall('socket-close');
   });
 
   ws.on('error', (err) => {
+    errorCount++;
     log('error', '[WS] socket error', { callSid, err: err?.message });
   });
 }
