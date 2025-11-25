@@ -81,7 +81,7 @@ class Tenant extends Model
 
     public function elevenLabs(): HasOne
     {
-        return $this->hasOne(ElevenlabsSetting::class, 'tenant_id');
+        return $this->hasOne(ElevenLabs::class, 'tenant_id');
     }
 
     public function twilioSettings(): HasMany

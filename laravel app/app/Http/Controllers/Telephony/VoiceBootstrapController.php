@@ -52,6 +52,7 @@ class VoiceBootstrapController extends Controller
             'call_id' => $callSession?->id,
             'tenant_id' => $tenant->id,
             'ws_url' => $this->mediaStreamUrl($callSession, $tenant),
+            'openai_api_key' => $tenant->openAiKey(),
             'config' => $config,
         ]);
     }

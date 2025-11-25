@@ -521,8 +521,9 @@ async function handleMediaStream(ws) {
     const state = ensureCallState();
     if (!state?.bootstrap?.config?.realtime_enabled) return null;
 
-    if (!OPENAI_API_KEY) {
-      log('warn', '[REALTIME] skipped: missing OPENAI_API_KEY', { callSid });
+    const apiKey = state.bootstrap?.openai_api_key || OPENAI_API_KEY;
+    if (!apiKey) {
+      log('warn', '[REALTIME] skipped: missing OpenAI API key', { callSid });
       return null;
     }
 
@@ -533,7 +534,7 @@ async function handleMediaStream(ws) {
     const rtUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
 
     const rtWs = new WebSocket(rtUrl, {
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      headers: { Authorization: `Bearer ${apiKey}` },
     });
 
     state.realtime = { ws: rtWs, ready: false, keepAlive: null };
