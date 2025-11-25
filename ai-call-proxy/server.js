@@ -271,10 +271,15 @@ async function handleMediaStream(ws) {
           bootstrap: null,
           bootstrapFetched: false,
           realtime: null,
+          segmentQueue: [],
+          segmentWorkerActive: false,
+          segmentIndexes: { user: 0, assistant: 0 },
         };
         calls.set(newKey, callState);
       } else {
         callState.ingestQueue = callState.ingestQueue || [];
+        callState.segmentQueue = callState.segmentQueue || [];
+        callState.segmentIndexes = callState.segmentIndexes || { user: 0, assistant: 0 };
       }
       callKey = newKey;
     }
@@ -319,18 +324,50 @@ async function handleMediaStream(ws) {
     }
     if (!assistantPcm16Buffers.length) return;
     const pcmBuf = Buffer.concat(assistantPcm16Buffers);
-    const ms = assistantSegmentStartedAt ? (Date.now() - assistantSegmentStartedAt) : 0;
+    const now = Date.now();
+    const startTs = assistantSegmentStartedAt || now;
+    const ms = now - startTs;
     const lastDeltaAgo = assistantLastChunkAt ? (Date.now() - assistantLastChunkAt) : 0;
+    const segmentIndex = nextSegmentIndex('assistant');
+    const audioB64 = pcmBuf.toString('base64');
+    const samples = pcmBuf.length / 2;
+    enqueueSegmentJob({
+      role: 'assistant',
+      segmentIndex,
+      audioB64,
+      startedAt: startTs,
+      endedAt: now,
+      durationMs: ms,
+      streamSid,
+      reason,
+      samples,
+    });
     assistantPcm16Buffers = [];
     assistantSegmentStartedAt = 0;
     assistantLastChunkAt = 0;
-    log('info', '[SEGMENT] assistant finalized', { callSid, reason, ms, lastDeltaAgo, samples: pcmBuf.length / 2 });
+    log('info', '[SEGMENT] assistant finalized', { callSid, reason, ms, lastDeltaAgo, samples, segmentIndex });
   }
 
   function finalizeUserSegment(reason = 'silence') {
     if (!userPcm16Buffers.length) return;
     const pcmBuf = Buffer.concat(userPcm16Buffers);
-    const ms = userSegmentStartedAt ? (Date.now() - userSegmentStartedAt) : 0;
+    const now = Date.now();
+    const startTs = userSegmentStartedAt || now;
+    const ms = now - startTs;
+    const segmentIndex = nextSegmentIndex('user');
+    const audioB64 = pcmBuf.toString('base64');
+    const samples = pcmBuf.length / 2;
+    enqueueSegmentJob({
+      role: 'user',
+      segmentIndex,
+      audioB64,
+      startedAt: startTs,
+      endedAt: now,
+      durationMs: ms,
+      streamSid,
+      reason,
+      samples,
+    });
     userPcm16Buffers = [];
     userSegmentStartedAt = 0;
     userSegLastVoiceAt = 0;
@@ -344,7 +381,7 @@ async function handleMediaStream(ws) {
       catch (err) { log('error', '[REALTIME] response.create failed', { callSid, err: err?.message }); }
     }
 
-    log('info', '[SEGMENT] user finalized', { callSid, reason, ms, samples: pcmBuf.length / 2 });
+    log('info', '[SEGMENT] user finalized', { callSid, reason, ms, samples, segmentIndex });
   }
 
   async function fetchBootstrapConfig() {
@@ -410,6 +447,77 @@ async function handleMediaStream(ws) {
     }
     state.realtime.ws = null;
     state.realtime.ready = false;
+  }
+
+  function nextSegmentIndex(role = 'user') {
+    if (!callState) return 0;
+    callState.segmentIndexes = callState.segmentIndexes || { user: 0, assistant: 0 };
+    callState.segmentIndexes[role] = (callState.segmentIndexes[role] || 0) + 1;
+    return callState.segmentIndexes[role];
+  }
+
+  function enqueueSegmentJob(job) {
+    if (!callState) return;
+    callState.segmentQueue = callState.segmentQueue || [];
+    callState.segmentQueue.push(job);
+    setImmediate(drainSegmentQueue);
+  }
+
+  async function drainSegmentQueue() {
+    if (!callState || callState.segmentWorkerActive) return;
+    callState.segmentWorkerActive = true;
+    callState.segmentQueue = callState.segmentQueue || [];
+
+    while (callState.segmentQueue.length) {
+      const job = callState.segmentQueue.shift();
+      try {
+        await sendSegmentJob(job);
+      } catch (err) {
+        log('error', '[SEGMENT] job failed', { callSid, err: err?.message });
+      }
+    }
+
+    callState.segmentWorkerActive = false;
+  }
+
+  async function sendSegmentJob(job = {}) {
+    const sessionId = job.sessionId || callState?.callId || callId || callSid;
+    if (!sessionId) {
+      log('warn', '[SEGMENT] skipped: missing session id', { callSid, role: job.role });
+      return;
+    }
+
+    const url = `${LARAVEL_API_BASE}/api/call-sessions/${encodeURIComponent(sessionId)}/segments`;
+    const payload = {
+      role: job.role,
+      segment_index: job.segmentIndex,
+      call_id: callState?.callId || null,
+      call_sid: callSid || null,
+      tenant_id: callState?.tenantId || tenantId || null,
+      audio_b64: job.audioB64,
+      metadata: {
+        started_at: job.startedAt ? new Date(job.startedAt).toISOString() : null,
+        ended_at: job.endedAt ? new Date(job.endedAt).toISOString() : null,
+        duration_ms: job.durationMs || null,
+        stream_sid: job.streamSid || streamSid || null,
+        reason: job.reason || null,
+        samples: job.samples || null,
+      },
+    };
+
+    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${APP_SHARED_TOKEN}` };
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await axios.post(url, payload, { headers, timeout: 10000 });
+        log('info', '[SEGMENT] posted', { callSid, role: job.role, idx: job.segmentIndex, attempt });
+        return;
+      } catch (err) {
+        const errData = err?.response?.data || err.message;
+        log('warn', '[SEGMENT] post failed', { callSid, role: job.role, idx: job.segmentIndex, attempt, err: errData });
+        if (attempt < 3) await new Promise((res) => setTimeout(res, attempt * 500));
+      }
+    }
   }
 
   async function ensureRealtimeSession() {
