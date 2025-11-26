@@ -567,7 +567,10 @@ async function handleMediaStream(ws) {
     const rtUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
 
     const rtWs = new WebSocket(rtUrl, {
-      headers: { Authorization: `Bearer ${apiKey}` },
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'OpenAI-Beta': 'realtime=v1',
+      },
     });
 
     state.realtime = { ws: rtWs, ready: false, keepAlive: null, inputSamplesBuffered: 0 };
@@ -577,8 +580,9 @@ async function handleMediaStream(ws) {
       const sessionUpdate = {
         type: 'session.update',
         session: {
-          type: 'session',
-          model,
+          type: 'realtime',
+          // Explicitly configure realtime per https://platform.openai.com/docs/guides/realtime-websocket
+          turn_detection: { type: 'server_vad' },
           voice: config.realtime_voice || undefined,
           language: config.realtime_language || undefined,
           input_audio_format: 'pcm16',
