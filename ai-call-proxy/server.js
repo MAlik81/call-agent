@@ -1,761 +1,585 @@
-// server.js — WS proxy with per-call dedupe, VAD, WAV ingest, and structured logs
-require('dotenv').config();
-const express = require('express');
-const http = require('http');
-const url = require('url');
-const WebSocket = require('ws');
-const axios = require('axios');
+import Fastify from 'fastify';
+import WebSocket from 'ws';
+import dotenv from 'dotenv';
+import fastifyFormBody from '@fastify/formbody';
+import fastifyWs from '@fastify/websocket';
+import axios from 'axios';
 
-// ---------- logger ----------
-const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
-const LOG_LEVEL = process.env.LOG_LEVEL ? (LOG_LEVELS[process.env.LOG_LEVEL] ?? 2) : 2; // default=info
-const LOG_FRAME_EVERY = parseInt(process.env.LOG_FRAME_EVERY || '50', 10);
-let _frameCounter = 0;
+// Load environment variables from .env file
+dotenv.config();
 
-function stamp() {
-  const d = new Date();
-  const t = d.toISOString();
-  const ms = String(d.getMilliseconds()).padStart(3, '0');
-  return `${t.slice(0, 19)}.${ms}Z`;
-}
-function log(level, msg, meta = {}) {
-  if ((LOG_LEVELS[level] ?? 99) > LOG_LEVEL) return;
-  const line = `[${stamp()}] ${level.toUpperCase()} ${msg}`;
-  if (meta && Object.keys(meta).length) {
-    (level === 'error' ? console.error : console.log)(line, meta);
-  } else {
-    (level === 'error' ? console.error : console.log)(line);
-  }
-}
-
-// ---------- env ----------
+// ---- ENV / constants ------------------------------------------------
 const {
-  PORT = 3000,
-  LARAVEL_API_BASE,
-  OPENAI_API_KEY,
+  OPENAI_API_KEY: DEFAULT_OPENAI_API_KEY, // global fallback
+  LARAVEL_API_BASE = 'https://mimivirtualagent.com',
 } = process.env;
 
-if (!LARAVEL_API_BASE) {
-  log('error', 'Missing env: LARAVEL_API_BASE');
-  process.exit(1);
+if (!DEFAULT_OPENAI_API_KEY && !LARAVEL_API_BASE) {
+  console.error('Missing OPENAI_API_KEY and/or LARAVEL_API_BASE env vars.');
 }
 
-// ---------- express/http/ws ----------
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true });
+// Defaults if Laravel doesn’t override
+const DEFAULT_SYSTEM_MESSAGE =
+  'You are a helpful and bubbly AI assistant who loves to chat about anything the user is interested in.';
+const DEFAULT_VOICE = 'alloy';
+const DEFAULT_MODEL = 'gpt-realtime';
+const TEMPERATURE = 0.8;
+const PORT = process.env.PORT || 5050;
 
-// ---------- global per-call state ----------
-/**
- * calls.set(callSid, {
- *   tenantId,
- *   ws,
- *   bootstrap,
- *   bootstrapFetched,
- *   realtime,
- *   segmentQueue,
- *   segmentWorkerActive,
- *   segmentIndexes,
- * })
- */
-const calls = new Map();
+// Events we log from Realtime
+const LOG_EVENT_TYPES = [
+  'error',
+  'response.content.done',
+  'rate_limits.updated',
+  'response.done',
+  'input_audio_buffer.committed',
+  'input_audio_buffer.speech_stopped',
+  'input_audio_buffer.speech_started',
+  'session.created',
+  'session.updated',
+];
 
-// ---------- VAD tuning ----------
-const RMS_ON            = 0.018;   // speech starts above this
-const REALTIME_SAMPLE_RATE = 16000;
-const MIN_REALTIME_COMMIT_SAMPLES = Math.ceil(REALTIME_SAMPLE_RATE * 0.1); // >=100ms
-const USER_SEG_SILENCE_MS = 800;   // end user segment after this much silence
-const USER_SEG_MAX_MS = 12000;     // hard stop user segments
-const ASSISTANT_SEG_IDLE_MS = 1200; // end assistant segment if idle
-const ASSISTANT_SEG_MAX_MS = 15000; // hard stop assistant segments
+// Optional extra timing logs (leave false in prod)
+const SHOW_TIMING_MATH = false;
 
-// ---------- audio utils: μ-law -> PCM16, WAV, RMS ----------
-function decodeMulawToPCM16(muBuf) {
-  const pcm = Buffer.alloc(muBuf.length * 2);
-  for (let i = 0; i < muBuf.length; i++) {
-    let u = (~muBuf[i]) & 0xff;
-    const sign = u & 0x80;
-    const exponent = (u & 0x70) >> 4;
-    const mantissa = u & 0x0f;
-    let t = ((mantissa << 3) + 0x84) << exponent; // bias 0x84
-    let sample = sign ? (0x84 - t) : (t - 0x84);
-    if (sample > 32767) sample = 32767;
-    if (sample < -32768) sample = -32768;
-    pcm.writeInt16LE(sample, i * 2);
-  }
-  return pcm;
-}
+// ---- Laravel helpers -------------------------------------------------
 
-function rmsPcm16(pcmBuf) {
-  if (!pcmBuf || pcmBuf.length < 2) return 0;
-  let sum = 0;
-  const samples = pcmBuf.length / 2;
-  for (let i = 0; i < pcmBuf.length; i += 2) {
-    const s = pcmBuf.readInt16LE(i);
-    sum += s * s;
-  }
-  return Math.sqrt(sum / samples) / 32768;
-}
+async function fetchBootstrap({ callSid, tenantId, callId }) {
+  const url = `${LARAVEL_API_BASE}/api/voice/bootstrap`;
+  const payload = {
+    call_sid: callSid || null,
+    tenant_id: tenantId || null,
+    call_id: callId || null,
+  };
 
-function resamplePcm16(pcmBuf, fromRate, toRate) {
-  if (!pcmBuf || fromRate === toRate) return pcmBuf;
-
-  const fromSamples = pcmBuf.length / 2;
-  const toSamples = Math.max(1, Math.round(fromSamples * toRate / fromRate));
-  const out = Buffer.alloc(toSamples * 2);
-  const ratio = fromSamples / toSamples;
-
-  for (let i = 0; i < toSamples; i++) {
-    const pos = i * ratio;
-    const base = Math.floor(pos);
-    const frac = pos - base;
-    const s1 = pcmBuf.readInt16LE(Math.min(base, fromSamples - 1) * 2);
-    const s2 = pcmBuf.readInt16LE(Math.min(base + 1, fromSamples - 1) * 2);
-    const sample = Math.round(s1 + (s2 - s1) * frac);
-    out.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), i * 2);
-  }
-
-  return out;
-}
-
-function encodePCM16ToMulaw(pcmBuf) {
-  const mu = Buffer.alloc(pcmBuf.length / 2);
-  for (let i = 0; i < pcmBuf.length; i += 2) {
-    let sample = pcmBuf.readInt16LE(i);
-    const sign = sample < 0 ? 0x80 : 0;
-    if (sample < 0) sample = -sample;
-    if (sample > 32635) sample = 32635;
-
-    sample += 0x84; // bias
-    const exponent = Math.floor(Math.log(sample) / Math.log(2)) - 7;
-    const mantissa = (sample >> (exponent + 3)) & 0x0f;
-    const uval = ~(sign | (exponent << 4) | mantissa) & 0xff;
-    mu[i / 2] = uval;
-  }
-  return mu;
-}
-
-// ---------- routes ----------
-app.get('/', (_req, res) => res.send('<h1>AI Call Proxy — WS up</h1>'));
-app.get('/ws-status', (_req, res) => {
-  log('info', '[STATUS] ws-status check', { LARAVEL_API_BASE });
-  const wsRunning = !!wss && typeof wss.handleUpgrade === 'function';
-  const activeCalls = Array.from(calls.values()).filter(c => c.ws !== null).length;
-  res.json({ ws_server_running: wsRunning, ws_active_calls: activeCalls, LARAVEL_API_BASE });
-});
-
-// ---------- upgrade -> ws ----------
-server.on('upgrade', (request, socket, head) => {
-  const { pathname, query } = url.parse(request.url, true);
-  log('info', '[UPGRADE] request', { pathname, query });
-
-  const isMediaPath = pathname === '/media-stream' || pathname === '/twilio-media';
-
-  if (isMediaPath) {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      ws.params = query;
-      handleMediaStream(ws);
+  try {
+    const { data } = await axios.post(url, payload, { timeout: 8000 });
+    console.log('[BOOTSTRAP] fetched', {
+      callSid,
+      callId,
+      tenantId,
+      model: data?.model,
+      voice: data?.realtime_voice,
     });
-  } else {
-    log('warn', '[UPGRADE] unknown path, closing', { pathname });
-    socket.destroy();
+
+    return {
+      apiKey: data?.openai_api_key || DEFAULT_OPENAI_API_KEY,
+      model: data?.model || DEFAULT_MODEL,
+      voice: data?.realtime_voice || DEFAULT_VOICE,
+      systemMessage:
+        data?.realtime_system_prompt ||
+        data?.prompt ||
+        DEFAULT_SYSTEM_MESSAGE,
+      raw: data,
+    };
+  } catch (err) {
+    console.error('[BOOTSTRAP] failed, falling back to defaults', {
+      callSid,
+      err: err?.response?.data || err.message,
+    });
+    return {
+      apiKey: DEFAULT_OPENAI_API_KEY,
+      model: DEFAULT_MODEL,
+      voice: DEFAULT_VOICE,
+      systemMessage: DEFAULT_SYSTEM_MESSAGE,
+      raw: null,
+    };
   }
+}
+
+async function postSegmentToLaravel(segment) {
+  const url = `${LARAVEL_API_BASE}/api/call-segments`;
+
+  // You can add auth headers if needed (e.g., internal token)
+  try {
+    await axios.post(url, segment, {
+      timeout: 8000,
+      headers: { 'Content-Type': 'application/json' },
+    });
+    // console.log('[SEGMENT] posted', {
+    //   role: segment.role,
+    //   idx: segment.segment_index,
+    //   dur: segment.duration_ms,
+    // });
+  } catch (err) {
+    console.error('[SEGMENT] post failed', {
+      role: segment.role,
+      idx: segment.segment_index,
+      err: err?.response?.data || err.message,
+    });
+  }
+}
+
+// ---- Fastify & WS setup ----------------------------------------------
+
+const fastify = Fastify();
+fastify.register(fastifyFormBody);
+fastify.register(fastifyWs);
+
+// Simple health check
+fastify.get('/', async (_request, reply) => {
+  reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
-// ---------- core WS handler ----------
-async function handleMediaStream(ws) {
-  let streamSid = null;
-  let callSid = ws.params?.call_sid || null;
-  let callId = Number.parseInt(ws.params?.call_id, 10);
-  callId = Number.isFinite(callId) ? callId : null;
-  let tenantId = ws.params?.tenant_id || 'unknown-tenant';
-  let tenantUuid = ws.params?.tenant_uuid || null;
-  let toNumber = ws.params?.to_number || ws.params?.to || ws.params?.Called || null;
+// NO TwiML route here – your Laravel app returns the <Response> with <Connect><Stream>
 
-  // lifecycle
-  let connOpenedAt = Date.now();
-  let callEnded = false;
-  let errorCount = 0;
-  let rtErrorCount = 0;
+// WebSocket route for Twilio <Stream>
+fastify.register(async (fastifyInstance) => {
+  fastifyInstance.get(
+    '/media-stream',
+    { websocket: true },
+    (connection, req) => {
+      console.log('🔗 New Twilio media stream connected.');
 
-  // live metrics
-  let bytesIn = 0;
-  let chunksIn = 0;
+      // Per-connection state
+      let streamSid = null;
+      let latestMediaTimestamp = 0;
 
-  // per-connection flags
-  let connActive = true;
+      // call / tenant identifiers
+      let callSid = null;
+      let callId = null;
+      let tenantId = null;
 
-  // realtime audio bridging
-  let userPcm16Buffers = [];
-  let assistantPcm16Buffers = [];
-  let userSegmentStartedAt = 0;
-  let assistantSegmentStartedAt = 0;
-  let userSegLastVoiceAt = 0;
-  let assistantLastChunkAt = 0;
-  let assistantIdleTimer = null;
+      // OpenAI Realtime WS (created lazily after bootstrap)
+      let openAiWs = null;
+      let openAiReady = false;
 
-  // per-call shared state
-  let callState = null;
-  let callKey = null;
+      // derived config from Laravel
+      let realtimeModel = DEFAULT_MODEL;
+      let realtimeVoice = DEFAULT_VOICE;
+      let systemMessage = DEFAULT_SYSTEM_MESSAGE;
 
-  function getCallKey() {
-    if (callSid) return callSid;
-    if (callId) return `call-${callId}`;
-    return null;
-  }
+      // Twilio barge-in tracking (from original sample)
+      let lastAssistantItem = null;
+      let markQueue = [];
+      let responseStartTimestampTwilio = null;
 
-  function ensureCallState() {
-    const newKey = getCallKey();
-    if (!newKey) return null;
+      // Simple segment indexes
+      let userSegmentIndex = 0;
+      let assistantSegmentIndex = 0;
 
-    if (callState && callKey && callKey !== newKey) {
-      calls.delete(callKey);
-      calls.set(newKey, callState);
-      callKey = newKey;
-    }
+      // Buffers for logging audio back to Laravel (audio/pcmu)
+      let currentUserBuffers = []; // Buffers of raw PCMU from Twilio
+      let userSpeechActive = false;
+      let userSpeechStartMs = null;
 
-    if (!callState) {
-      callState = calls.get(newKey);
-      if (!callState) {
-        callState = {
-          callId: callId || null,
-          callSid: callSid || null,
-          tenantId: tenantId || 'unknown-tenant',
-          tenantUuid: tenantUuid || null,
-          toNumber: toNumber || null,
-          ws: null,
-          bootstrap: null,
-          bootstrapFetched: false,
-          realtime: null,
-          segmentQueue: [],
-          segmentWorkerActive: false,
-          segmentIndexes: { user: 0, assistant: 0 },
+      let currentAssistantBuffers = []; // Buffers of raw PCMU from OpenAI
+      let assistantResponseStartMs = null;
+
+      // Helper: send a mark to Twilio to detect playback completion
+      const sendMark = () => {
+        if (!streamSid) return;
+        const markEvent = {
+          event: 'mark',
+          streamSid,
+          mark: { name: 'responsePart' },
         };
-        calls.set(newKey, callState);
-      } else {
-        callState.segmentQueue = callState.segmentQueue || [];
-        callState.segmentIndexes = callState.segmentIndexes || { user: 0, assistant: 0 };
-      }
-      callKey = newKey;
-    }
-
-    callState.callSid = callSid || callState.callSid;
-    callState.callId = callId || callState.callId;
-    callState.tenantId = tenantId || callState.tenantId || 'unknown-tenant';
-    callState.tenantUuid = tenantUuid || callState.tenantUuid || null;
-    callState.toNumber = toNumber || callState.toNumber || null;
-
-    return callState;
-  }
-
-  function appendAudioToRealtime(pcm16) {
-    const rt = callState?.realtime;
-    if (!rt?.ready || rt.ws?.readyState !== WebSocket.OPEN) return;
-    try {
-      rt.ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: pcm16.toString('base64') }));
-      rt.inputSamplesBuffered = (rt.inputSamplesBuffered || 0) + (pcm16.length / 2);
-    } catch (err) {
-      log('error', '[REALTIME] append failed', { callSid, err: err?.message });
-    }
-  }
-
-  function sendAudioToTwilio(muBuf) {
-    const tws = callState?.ws || ws;
-    if (!tws || tws.readyState !== WebSocket.OPEN || !streamSid) return;
-    const payload = { event: 'media', streamSid, media: { payload: muBuf.toString('base64') } };
-    try { tws.send(JSON.stringify(payload)); }
-    catch (err) { log('error', '[TWILIO] send failed', { callSid, err: err?.message }); }
-  }
-
-  function resetAssistantIdleTimer() {
-    if (assistantIdleTimer) clearTimeout(assistantIdleTimer);
-    if (!assistantPcm16Buffers.length) return;
-    assistantIdleTimer = setTimeout(() => finalizeAssistantSegment('silence'), ASSISTANT_SEG_IDLE_MS);
-  }
-
-  function finalizeAssistantSegment(reason = 'complete') {
-    if (assistantIdleTimer) {
-      clearTimeout(assistantIdleTimer);
-      assistantIdleTimer = null;
-    }
-    if (!assistantPcm16Buffers.length) return;
-    const pcmBuf = Buffer.concat(assistantPcm16Buffers);
-    const now = Date.now();
-    const startTs = assistantSegmentStartedAt || now;
-    const ms = now - startTs;
-    const lastDeltaAgo = assistantLastChunkAt ? (Date.now() - assistantLastChunkAt) : 0;
-    const segmentIndex = nextSegmentIndex('assistant');
-    const audioB64 = pcmBuf.toString('base64');
-    const samples = pcmBuf.length / 2;
-    enqueueSegmentJob({
-      role: 'assistant',
-      segmentIndex,
-      format: 'pcm16',
-      sampleRate: REALTIME_SAMPLE_RATE,
-      audioB64,
-      startedAt: startTs,
-      endedAt: now,
-      durationMs: ms,
-      streamSid,
-      reason,
-      samples,
-    });
-    assistantPcm16Buffers = [];
-    assistantSegmentStartedAt = 0;
-    assistantLastChunkAt = 0;
-    log('info', '[SEGMENT] assistant finalized', { callSid, reason, ms, lastDeltaAgo, samples, segmentIndex });
-  }
-
-  function finalizeUserSegment(reason = 'silence') {
-    if (!userPcm16Buffers.length) return;
-    const pcmBuf = Buffer.concat(userPcm16Buffers);
-    const now = Date.now();
-    const startTs = userSegmentStartedAt || now;
-    const ms = now - startTs;
-    const segmentIndex = nextSegmentIndex('user');
-    const audioB64 = pcmBuf.toString('base64');
-    const samples = pcmBuf.length / 2;
-    enqueueSegmentJob({
-      role: 'user',
-      segmentIndex,
-      format: 'pcm16',
-      sampleRate: REALTIME_SAMPLE_RATE,
-      audioB64,
-      startedAt: startTs,
-      endedAt: now,
-      durationMs: ms,
-      streamSid,
-      reason,
-      samples,
-    });
-    userPcm16Buffers = [];
-    userSegmentStartedAt = 0;
-    userSegLastVoiceAt = 0;
-
-    const rt = callState?.realtime;
-    if (rt?.ready && rt.ws?.readyState === WebSocket.OPEN) {
-      if (rt.inputSamplesBuffered && rt.inputSamplesBuffered > 0) {
-        if (rt.inputSamplesBuffered < MIN_REALTIME_COMMIT_SAMPLES) {
-          const missingSamples = MIN_REALTIME_COMMIT_SAMPLES - rt.inputSamplesBuffered;
-          const silenceBuf = Buffer.alloc(missingSamples * 2);
-          appendAudioToRealtime(silenceBuf);
-          log('warn', '[REALTIME] padded silence before commit', { callSid, missingSamples });
-        }
-        try { rt.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); }
-        catch (err) { log('error', '[REALTIME] commit failed', { callSid, err: err?.message }); }
-        rt.inputSamplesBuffered = 0;
-      } else {
-        log('warn', '[REALTIME] skip commit: empty audio buffer', { callSid });
-      }
-
-      if (rt.responseInFlight) {
-        log('warn', '[REALTIME] skip response.create: response in progress', { callSid });
-      } else {
-        try {
-          rt.ws.send(JSON.stringify({ type: 'response.create' }));
-          rt.responseInFlight = true;
-        }
-        catch (err) { log('error', '[REALTIME] response.create failed', { callSid, err: err?.message }); }
-      }
-    }
-
-    log('info', '[SEGMENT] user finalized', { callSid, reason, ms, samples, segmentIndex });
-  }
-
-  async function fetchBootstrapConfig() {
-    const state = ensureCallState();
-    if (!state || state.bootstrapFetched) return state?.bootstrap || null;
-
-    state.bootstrapFetched = true;
-
-    const payload = {};
-    if (state.callId) payload.call_id = state.callId;
-    if (state.toNumber) payload.to_number = state.toNumber;
-    if (state.tenantId) payload.tenant_id = state.tenantId;
-    if (state.tenantUuid) payload.tenant_uuid = state.tenantUuid;
-
-    if (!payload.call_id && !payload.to_number) {
-      log('warn', '[BOOTSTRAP] skipped: missing call_id and to_number', { callSid });
-      return null;
-    }
-
-    try {
-      const resp = await axios.post(
-        `${LARAVEL_API_BASE}/api/voice/bootstrap`,
-        payload,
-        { timeout: 10000 },
-      );
-      state.bootstrap = resp.data;
-      log('info', '[BOOTSTRAP] fetched', { callSid, callId: state.callId, tenantId: state.tenantId });
-    } catch (err) {
-      const errMeta = err?.response?.data || err.message;
-      log('error', '[BOOTSTRAP] failed', { callSid, err: errMeta });
-      state.bootstrap = state.bootstrap || { config: { realtime_enabled: true } };
-      log('warn', '[BOOTSTRAP] continuing with realtime bridge only', { callSid, err: errMeta });
-    }
-
-    return state.bootstrap;
-  }
-
-  function buildRealtimeInstructions(config = {}) {
-    const sections = [];
-    if (config.realtime_system_prompt) sections.push(config.realtime_system_prompt);
-    else if (config.prompt) sections.push(config.prompt);
-
-    if (Array.isArray(config.rules) && config.rules.length) {
-      const rules = config.rules.map((r, i) => `${i + 1}. ${r}`).join('\n');
-      sections.push(`Call rules:\n${rules}`);
-    }
-
-    return sections.filter(Boolean).join('\n\n');
-  }
-
-  function attachRealtimeKeepAlive(state) {
-    if (!state?.realtime?.ws) return;
-    if (state.realtime.keepAlive) clearInterval(state.realtime.keepAlive);
-
-    state.realtime.keepAlive = setInterval(() => {
-      try { state.realtime.ws.ping(); } catch { clearInterval(state.realtime.keepAlive); }
-    }, 10000);
-  }
-
-  function closeRealtime(state) {
-    if (!state?.realtime) return;
-    if (state.realtime.keepAlive) {
-      clearInterval(state.realtime.keepAlive);
-      state.realtime.keepAlive = null;
-    }
-    if (state.realtime.ws && state.realtime.ws.readyState === WebSocket.OPEN) {
-      try { state.realtime.ws.close(); } catch {}
-    }
-    state.realtime.ws = null;
-    state.realtime.ready = false;
-  }
-
-  function endCall(reason = 'unknown') {
-    if (callEnded) return;
-    callEnded = true;
-    connActive = false;
-
-    finalizeUserSegment(reason);
-    finalizeAssistantSegment(reason);
-    closeRealtime(callState);
-
-    const key = getCallKey();
-    if (key && calls.get(key)?.ws === ws) {
-      calls.get(key).ws = null;
-    }
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.close(); } catch {}
-    }
-
-    const durationMs = Date.now() - connOpenedAt;
-    log('info', '[CALL] ended', { callSid, reason, durationMs, errors: errorCount, realtimeErrors: rtErrorCount, chunksIn, bytesIn });
-  }
-
-  function nextSegmentIndex(role = 'user') {
-    if (!callState) return 0;
-    callState.segmentIndexes = callState.segmentIndexes || { user: 0, assistant: 0 };
-    callState.segmentIndexes[role] = (callState.segmentIndexes[role] || 0) + 1;
-    return callState.segmentIndexes[role];
-  }
-
-  function enqueueSegmentJob(job) {
-    if (!callState) return;
-    callState.segmentQueue = callState.segmentQueue || [];
-    callState.segmentQueue.push(job);
-    setImmediate(drainSegmentQueue);
-  }
-
-  async function drainSegmentQueue() {
-    if (!callState || callState.segmentWorkerActive) return;
-    callState.segmentWorkerActive = true;
-    callState.segmentQueue = callState.segmentQueue || [];
-
-    while (callState.segmentQueue.length) {
-      const job = callState.segmentQueue.shift();
-      try {
-        await sendSegmentJob(job);
-      } catch (err) {
-        log('error', '[SEGMENT] job failed', { callSid, err: err?.message });
-      }
-    }
-
-    callState.segmentWorkerActive = false;
-  }
-
-  async function sendSegmentJob(job = {}) {
-    const sessionId = job.sessionId || callState?.callId || callId || callSid;
-    if (!sessionId) {
-      log('warn', '[SEGMENT] skipped: missing session id', { callSid, role: job.role });
-      return;
-    }
-
-    const format = (typeof job.format === 'string' && job.format.trim()) ? job.format.trim() : 'pcm16';
-    const sampleRateCandidate = Number(job.sampleRate);
-    const sampleRate = Number.isFinite(sampleRateCandidate) ? sampleRateCandidate : REALTIME_SAMPLE_RATE;
-    const audioB64 = job.audioB64;
-
-    if (!audioB64) {
-      log('warn', '[SEGMENT] skipped: missing audio payload', { callSid, role: job.role, idx: job.segmentIndex });
-      return;
-    }
-
-    const url = `${LARAVEL_API_BASE}/api/call-sessions/${encodeURIComponent(sessionId)}/segments`;
-    const payload = {
-      role: job.role,
-      segment_index: job.segmentIndex,
-      call_id: callState?.callId || null,
-      call_sid: callSid || null,
-      tenant_id: callState?.tenantId || tenantId || null,
-      format,
-      sample_rate: sampleRate,
-      audio_b64: audioB64,
-      meta: {
-        started_at: job.startedAt ? new Date(job.startedAt).toISOString() : null,
-        ended_at: job.endedAt ? new Date(job.endedAt).toISOString() : null,
-        duration_ms: job.durationMs || null,
-        stream_sid: job.streamSid || streamSid || null,
-        reason: job.reason || null,
-        samples: job.samples || null,
-      },
-    };
-
-    const headers = { 'Content-Type': 'application/json' };
-
-    const isDuplicateError = (err) => {
-      const status = err?.response?.status;
-      const msg = (err?.response?.data?.message || err?.response?.data || err?.message || '').toString();
-      if (status === 409) return true;
-      return msg.includes('Duplicate entry') || msg.includes('call_segments_call_session_id_segment_index_unique');
-    };
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        await axios.post(url, payload, { headers, timeout: 10000 });
-        log('info', '[SEGMENT] posted', { callSid, role: job.role, idx: job.segmentIndex, attempt, format, sampleRate, audioBytes: audioB64.length });
-        return;
-      } catch (err) {
-        const errData = err?.response?.data || err.message;
-        log('warn', '[SEGMENT] post failed', { callSid, role: job.role, idx: job.segmentIndex, attempt, format, sampleRate, audioBytes: audioB64.length, err: errData });
-        if (isDuplicateError(err)) {
-          log('warn', '[SEGMENT] duplicate index, skipping retries', { callSid, role: job.role, idx: job.segmentIndex });
-          return;
-        }
-        if (attempt < 3) await new Promise((res) => setTimeout(res, attempt * 500));
-      }
-    }
-  }
-
-  async function ensureRealtimeSession() {
-    const state = ensureCallState();
-    // log state
-    log('debug', '[REALTIME] ensure session', { callSid, stateBootstrap: !!state?.bootstrap, realtimeReady: !!state?.realtime?.ready });
-    if (!state?.bootstrap?.config?.realtime_enabled) return null;
-
-    const apiKey = state.bootstrap?.openai_api_key || OPENAI_API_KEY;
-    if (!apiKey) {
-      log('warn', '[REALTIME] skipped: missing OpenAI API key', { callSid });
-      return null;
-    }
-
-    if (state.realtime?.ready && state.realtime.ws?.readyState === WebSocket.OPEN) return state.realtime;
-
-    const config = state.bootstrap.config || {};
-    const model = config.realtime_model || 'gpt-4o-realtime-preview';
-    const rtUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
-
-    const rtWs = new WebSocket(rtUrl, {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'OpenAI-Beta': 'realtime=v1',
-      },
-    });
-
-    state.realtime = { ws: rtWs, ready: false, keepAlive: null, inputSamplesBuffered: 0 };
-
-    rtWs.on('open', () => {
-      const instructions = buildRealtimeInstructions(config);
-      const sessionUpdate = {
-        type: 'session.update',
-        session: {
-          type: 'realtime',
-          // Explicitly configure realtime per https://platform.openai.com/docs/guides/realtime-websocket
-          turn_detection: { type: 'server_vad' },
-          voice: config.realtime_voice || undefined,
-          language: config.realtime_language || undefined,
-          input_audio_format: 'pcm16',
-          input_audio_sample_rate: REALTIME_SAMPLE_RATE,
-          output_audio_format: 'pcm16',
-          output_audio_sample_rate: REALTIME_SAMPLE_RATE,
-          input_audio_transcription: { enabled: true },
-          modalities: ['text', 'audio'],
-          instructions,
-        },
+        connection.send(JSON.stringify(markEvent));
+        markQueue.push('responsePart');
       };
 
-      try { rtWs.send(JSON.stringify(sessionUpdate)); }
-      catch (e) { log('error', '[REALTIME] failed to send session.update', { callSid, err: e?.message }); }
+      // Handle interruption when the caller starts speaking
+      const handleSpeechStartedEvent = () => {
+        // Original Twilio barge-in logic
+        if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
+          const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
+          if (SHOW_TIMING_MATH) {
+            console.log(
+              `Calculating elapsed time for truncation: ${latestMediaTimestamp} - ${responseStartTimestampTwilio} = ${elapsedTime}ms`,
+            );
+          }
 
-      state.realtime.ready = true;
-      state.realtime.responseInFlight = false;
-      attachRealtimeKeepAlive(state);
-      log('info', '[REALTIME] session opened', { callSid, model });
-    });
+          if (lastAssistantItem && openAiWs && openAiReady) {
+            const truncateEvent = {
+              type: 'conversation.item.truncate',
+              item_id: lastAssistantItem,
+              content_index: 0,
+              audio_end_ms: elapsedTime,
+            };
+            if (SHOW_TIMING_MATH) {
+              console.log(
+                'Sending truncation event:',
+                JSON.stringify(truncateEvent),
+              );
+            }
+            openAiWs.send(JSON.stringify(truncateEvent));
+          }
 
-    rtWs.on('message', (msg) => {
-      let evt;
-      try { evt = JSON.parse(msg.toString()); }
-      catch (err) { return log('warn', '[REALTIME] parse error', { callSid, err: err?.message }); }
+          connection.send(
+            JSON.stringify({
+              event: 'clear',
+              streamSid,
+            }),
+          );
 
-      if (LOG_LEVEL >= LOG_LEVELS.debug) {
-        log('debug', '[REALTIME] message', { callSid, type: evt?.type, bytes: msg?.length || 0 });
-      }
-
-      if (evt?.type === 'response.audio.delta' || evt?.type === 'response.output_audio.delta' || evt?.type === 'response.output_audio.buffer.append') {
-        const base64 = evt.delta || evt.audio || evt.output_audio || evt.output_audio_delta || evt.data || evt.output_audio?.data;
-        if (!base64) return log('warn', '[REALTIME] missing audio delta payload', { callSid, type: evt?.type });
-
-        const pcm16 = Buffer.from(base64, 'base64');
-        assistantPcm16Buffers.push(pcm16);
-        const now = Date.now();
-        assistantLastChunkAt = now;
-        if (!assistantSegmentStartedAt) assistantSegmentStartedAt = now;
-
-        const pcm8 = resamplePcm16(pcm16, REALTIME_SAMPLE_RATE, 8000);
-        const mu = encodePCM16ToMulaw(pcm8);
-        sendAudioToTwilio(mu);
-        resetAssistantIdleTimer();
-
-        if (assistantSegmentStartedAt && (now - assistantSegmentStartedAt) >= ASSISTANT_SEG_MAX_MS) {
-          finalizeAssistantSegment('assistant-max');
+          // Reset
+          markQueue = [];
+          lastAssistantItem = null;
+          responseStartTimestampTwilio = null;
         }
-        return;
+
+        // Start a new user segment for logging
+        userSpeechActive = true;
+        currentUserBuffers = [];
+        userSpeechStartMs = latestMediaTimestamp;
+      };
+
+      // Flush user audio segment to Laravel
+      const flushUserSegment = (reason = 'speech_stopped') => {
+        if (!userSpeechActive || currentUserBuffers.length === 0) return;
+
+        const buf = Buffer.concat(currentUserBuffers);
+        const audioB64 = buf.toString('base64');
+        const startMs = userSpeechStartMs ?? latestMediaTimestamp;
+        const endMs = latestMediaTimestamp;
+        const durationMs = Math.max(0, endMs - startMs);
+
+        userSegmentIndex += 1;
+
+        postSegmentToLaravel({
+          call_id: callId,
+          call_sid: callSid,
+          tenant_id: tenantId,
+          stream_sid: streamSid,
+          role: 'user',
+          segment_index: userSegmentIndex,
+          format: 'audio/pcmu',
+          audio_b64: audioB64,
+          start_ms: startMs,
+          end_ms: endMs,
+          duration_ms: durationMs,
+          reason,
+        });
+
+        currentUserBuffers = [];
+        userSpeechActive = false;
+        userSpeechStartMs = null;
+
+        console.log(
+          `📝 Posted user segment idx=${userSegmentIndex}, dur=${durationMs}ms, reason=${reason}`,
+        );
+      };
+
+      // Flush assistant segment to Laravel
+      const flushAssistantSegment = (reason = 'response_done') => {
+        if (currentAssistantBuffers.length === 0) return;
+
+        const buf = Buffer.concat(currentAssistantBuffers);
+        const audioB64 = buf.toString('base64');
+        const startMs = assistantResponseStartMs ?? latestMediaTimestamp;
+        const endMs = latestMediaTimestamp;
+        const durationMs = Math.max(0, endMs - startMs);
+
+        assistantSegmentIndex += 1;
+
+        postSegmentToLaravel({
+          call_id: callId,
+          call_sid: callSid,
+          tenant_id: tenantId,
+          stream_sid: streamSid,
+          role: 'assistant',
+          segment_index: assistantSegmentIndex,
+          format: 'audio/pcmu',
+          audio_b64: audioB64,
+          start_ms: startMs,
+          end_ms: endMs,
+          duration_ms: durationMs,
+          reason,
+        });
+
+        currentAssistantBuffers = [];
+        assistantResponseStartMs = null;
+
+        console.log(
+          `📝 Posted assistant segment idx=${assistantSegmentIndex}, dur=${durationMs}ms, reason=${reason}`,
+        );
+      };
+
+      // Create OpenAI Realtime WS *after* we have bootstrap config
+      async function initOpenAiRealtime() {
+        if (!realtimeModel || !systemMessage) {
+          console.error(
+            '[REALTIME] init called without model/systemMessage, using defaults.',
+          );
+        }
+
+        // We expect that fetchBootstrap has set an API key on the instance via closure
+        const apiKey = (await fetchBootstrap({
+          callSid,
+          tenantId,
+          callId,
+        }))?.apiKey;
+
+        if (!apiKey) {
+          console.error(
+            '[REALTIME] No OpenAI API key from Laravel nor env, aborting.',
+          );
+          return;
+        }
+
+        const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(
+          realtimeModel,
+        )}&temperature=${TEMPERATURE}`;
+
+        openAiWs = new WebSocket(url, {
+          headers: { Authorization: `Bearer ${apiKey}` },
+        });
+
+        openAiWs.on('open', () => {
+          console.log('✅ Connected to the OpenAI Realtime API', {
+            model: realtimeModel,
+            voice: realtimeVoice,
+          });
+
+          const sessionUpdate = {
+            type: 'session.update',
+            session: {
+              type: 'realtime',
+              model: realtimeModel,
+              output_modalities: ['audio'],
+              audio: {
+                input: {
+                  format: { type: 'audio/pcmu' }, // Twilio PCMU passthrough
+                  turn_detection: { type: 'server_vad' },
+                },
+                output: {
+                  format: { type: 'audio/pcmu' },
+                  voice: realtimeVoice,
+                },
+              },
+              instructions: systemMessage,
+            },
+          };
+
+          console.log(
+            '[REALTIME] Sending session.update:',
+            JSON.stringify(sessionUpdate),
+          );
+          openAiWs.send(JSON.stringify(sessionUpdate));
+
+          // If you want AI to speak first, you can send an initial conversation here
+          // openAiWs.send(JSON.stringify({...}));
+          // openAiWs.send(JSON.stringify({ type: 'response.create' }));
+
+          openAiReady = true;
+        });
+
+        openAiWs.on('message', (raw) => {
+          let response;
+          try {
+            response = JSON.parse(raw.toString());
+          } catch (e) {
+            console.error('Error parsing OpenAI message:', e);
+            return;
+          }
+
+          if (LOG_EVENT_TYPES.includes(response.type)) {
+            console.log(`Received event: ${response.type}`, response);
+          }
+
+          // Realtime VAD events: map to our user segment boundaries
+          if (response.type === 'input_audio_buffer.speech_started') {
+            handleSpeechStartedEvent();
+            return;
+          }
+
+          if (
+            response.type === 'input_audio_buffer.speech_stopped' ||
+            response.type === 'input_audio_buffer.committed'
+          ) {
+            flushUserSegment(response.type);
+            return;
+          }
+
+          // Assistant audio chunks
+          if (
+            response.type === 'response.output_audio.delta' &&
+            response.delta
+          ) {
+            const audioDelta = {
+              event: 'media',
+              streamSid,
+              media: { payload: response.delta },
+            };
+
+            // Send to Twilio
+            connection.send(JSON.stringify(audioDelta));
+
+            // Start assistant timing when first audio arrives
+            if (!assistantResponseStartMs) {
+              assistantResponseStartMs = latestMediaTimestamp;
+              if (SHOW_TIMING_MATH) {
+                console.log(
+                  `[ASSIST] start at timestamp=${assistantResponseStartMs}ms`,
+                );
+              }
+            }
+
+            // Buffer raw PCMU bytes for logging
+            const pcmuBuf = Buffer.from(response.delta, 'base64');
+            currentAssistantBuffers.push(pcmuBuf);
+
+            // Track which assistant item this belongs to
+            if (response.item_id) {
+              lastAssistantItem = response.item_id;
+            }
+
+            // Send mark so Twilio can tell when playback completes
+            sendMark();
+            return;
+          }
+
+          // Assistant finished
+          if (response.type === 'response.done') {
+            flushAssistantSegment('response_done');
+            return;
+          }
+
+          // Error
+          if (response.type === 'error') {
+            console.error('❌ OpenAI API error:', response);
+          }
+        });
+
+        openAiWs.on('close', () => {
+          console.log('Disconnected from the OpenAI Realtime API');
+          openAiReady = false;
+        });
+
+        openAiWs.on('error', (err) => {
+          console.error('Error in the OpenAI WebSocket:', err);
+          openAiReady = false;
+        });
       }
 
-      if (evt?.type === 'response.completed' || evt?.type === 'response.output_audio.stopped' || evt?.type === 'response.audio.stopped') {
-        state.realtime.responseInFlight = false;
-        finalizeAssistantSegment('realtime-complete');
-        return;
-      }
+      // Handle messages from Twilio stream
+      connection.on('message', async (message) => {
+        let data;
+        try {
+          data = JSON.parse(message.toString());
+        } catch (e) {
+          console.error('Error parsing Twilio message:', e, 'Message:', message);
+          return;
+        }
 
-      if (evt?.type === 'error') {
-        rtErrorCount++;
-        state.realtime.responseInFlight = false;
-        log('error', '[REALTIME] event error', { callSid, err: evt?.error || evt?.message || evt });
-      }
-    });
+        switch (data.event) {
+          case 'start': {
+            streamSid = data.start.streamSid;
+            callSid = data.start.callSid;
+            console.log('🚀 Stream started', { callSid, streamSid });
 
-    rtWs.on('close', () => {
-      if (!callEnded) {
-        log('info', '[REALTIME] session closed', { callSid });
-        endCall('realtime-close');
-      }
-    });
+            // Custom params from TwiML <Parameter> (Laravel should set these)
+            const params = data.start.customParameters || {};
+            callId =
+              params.call_id ||
+              params.callId ||
+              params.CallId ||
+              params.CallID ||
+              null;
+            tenantId =
+              params.tenant_id ||
+              params.tenantId ||
+              params.TenantId ||
+              null;
 
-    rtWs.on('error', (err) => {
-      rtErrorCount++;
-      log('error', '[REALTIME] socket error', { callSid, err: err?.message });
-      endCall('realtime-error');
-    });
+            console.log('Custom params', { callId, tenantId });
 
-    return state.realtime;
+            // Reset timing on new stream
+            responseStartTimestampTwilio = null;
+            latestMediaTimestamp = 0;
+
+            // Fetch per-tenant config from Laravel and then init OpenAI
+            const bootstrap = await fetchBootstrap({ callSid, tenantId, callId });
+            if (bootstrap) {
+              realtimeModel = bootstrap.model || DEFAULT_MODEL;
+              realtimeVoice = bootstrap.voice || DEFAULT_VOICE;
+              systemMessage = bootstrap.systemMessage || DEFAULT_SYSTEM_MESSAGE;
+            }
+
+            await initOpenAiRealtime();
+            break;
+          }
+
+          case 'media': {
+            latestMediaTimestamp = data.media.timestamp;
+            if (SHOW_TIMING_MATH) {
+              console.log(
+                `Received media frame, timestamp=${latestMediaTimestamp}ms`,
+              );
+            }
+
+            if (!openAiWs || !openAiReady) {
+              // We haven't finished OpenAI handshake yet; drop frame
+              return;
+            }
+
+            // Append Twilio PCMU base64 directly to Realtime
+            const audioAppend = {
+              type: 'input_audio_buffer.append',
+              audio: data.media.payload,
+            };
+            openAiWs.send(JSON.stringify(audioAppend));
+
+            // Buffer raw PCMU for potential user segment logging
+            if (userSpeechActive) {
+              const buf = Buffer.from(data.media.payload, 'base64');
+              currentUserBuffers.push(buf);
+            }
+
+            break;
+          }
+
+          case 'mark': {
+            if (markQueue.length > 0) {
+              markQueue.shift();
+            }
+            break;
+          }
+
+          case 'stop': {
+            console.log('📴 Twilio stream stopped. Closing connections.');
+
+            // Flush any ongoing user segment
+            flushUserSegment('call_end');
+            flushAssistantSegment('call_end');
+
+            if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
+              openAiWs.close();
+            }
+            break;
+          }
+
+          case 'connected': {
+            console.log('Twilio WS connected event received.');
+            break;
+          }
+
+          default:
+            console.log('Received non-media event:', data.event);
+            break;
+        }
+      });
+
+      // On client disconnect
+      connection.on('close', () => {
+        console.log('🔌 Twilio WebSocket disconnected.');
+        if (openAiWs && openAiWs.readyState === WebSocket.OPEN) {
+          openAiWs.close();
+        }
+      });
+
+      connection.on('error', (err) => {
+        console.error('Twilio WS error:', err);
+      });
+    },
+  );
+});
+
+// Start server
+fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
+  if (err) {
+    console.error(err);
+    process.exit(1);
   }
-
-  ws.on('message', async (raw) => {
-    let data;
-    try { data = JSON.parse(raw.toString()); }
-    catch (e) { return log('error', '[WS] parse error', { err: e.message }); }
-
-    if (data.event === 'start') {
-      streamSid = data.start.streamSid;
-      callSid   = data.start.callSid || ws.params?.call_sid || callSid;
-
-      const cp = data.start.customParameters;
-      if (Array.isArray(cp)) {
-        for (const item of cp) {
-          if (item?.name === 'tenant_id') tenantId = item.value;
-          if (item?.name === 'tenant_uuid') tenantUuid = item.value;
-          if (item?.name === 'call_id') callId = Number.parseInt(item.value, 10) || callId;
-          if (item?.name === 'to_number') toNumber = item.value || toNumber;
-        }
-      } else if (cp && typeof cp === 'object') {
-        tenantId = cp.tenant_id || tenantId;
-        tenantUuid = cp.tenant_uuid || tenantUuid;
-        callId = Number.parseInt(cp.call_id, 10) || callId;
-        toNumber = cp.to_number || toNumber;
-      }
-
-      ensureCallState();
-      if (callState) {
-        if (callState.ws && callState.ws !== ws) {
-          try { callState.ws.close(); } catch {}
-        }
-        callState.ws = ws;
-      }
-
-      log('info', '[WS] start', { streamSid, callSid, tenantId, callId, toNumber });
-      await fetchBootstrapConfig();
-      await ensureRealtimeSession();
-      return;
-    }
-
-    if (data.event === 'media') {
-      if (!connActive || !callState) return;
-
-      // μ-law frame
-      const mu = Buffer.from(data.media.payload, 'base64');
-      const pcm8 = decodeMulawToPCM16(mu);
-      const pcm16 = resamplePcm16(pcm8, 8000, REALTIME_SAMPLE_RATE);
-      chunksIn++;
-      bytesIn += mu.length;
-      if (LOG_LEVEL >= LOG_LEVELS.debug && (++_frameCounter % LOG_FRAME_EVERY) === 0) {
-        log('debug', '[WS] media frame', { callSid, chunk: chunksIn, muBytes: mu.length });
-      }
-
-      // realtime streaming + segment buffer for user
-      appendAudioToRealtime(pcm16);
-
-      const segEnergy = rmsPcm16(pcm16);
-      const now = Date.now();
-
-      let bufferThisFrame = false;
-      if (segEnergy >= RMS_ON) {
-        if (!userSegmentStartedAt) userSegmentStartedAt = now;
-        userSegLastVoiceAt = now;
-        bufferThisFrame = true;
-      } else if (userSegmentStartedAt) {
-        bufferThisFrame = true;
-      }
-
-      if (bufferThisFrame) userPcm16Buffers.push(pcm16);
-
-      const segDuration = userSegmentStartedAt ? (now - userSegmentStartedAt) : 0;
-      const segSilence = userSegLastVoiceAt ? (now - userSegLastVoiceAt) : 0;
-      if (userPcm16Buffers.length && userSegLastVoiceAt && segSilence >= USER_SEG_SILENCE_MS) {
-        finalizeUserSegment('silence');
-      } else if (userPcm16Buffers.length && segDuration >= USER_SEG_MAX_MS) {
-        finalizeUserSegment('timeout');
-      }
-      return;
-    }
-
-    if (data.event === 'stop') {
-      log('info', '[WS] stop received', { callSid });
-      endCall('twilio-stop');
-      return;
-    }
-  });
-
-  ws.on('close', () => {
-    endCall('socket-close');
-  });
-
-  ws.on('error', (err) => {
-    errorCount++;
-    log('error', '[WS] socket error', { callSid, err: err?.message });
-  });
-}
-
-server.listen(PORT, () => log('info', 'WS proxy listening', { port: PORT }));
+  console.log(`📡 Media Stream server listening on port ${PORT}`);
+});
