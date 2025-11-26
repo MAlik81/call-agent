@@ -27,6 +27,7 @@ Route::post('/cron/process-call-segments', [CronController::class, 'processCallS
 Route::post('/twilio/calls/play', [TwilioCallControlController::class, 'play']);
 Route::post('/twilio/calls/stop', [TwilioCallControlController::class, 'stop']);
 
+Route::post('/call-segments', [CallSegmentController::class, 'storeFromProxy']);
 Route::post('/call-sessions/{call}/segments', [CallSegmentController::class, 'store']);
 
 
