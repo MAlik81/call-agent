@@ -63,6 +63,7 @@ const calls = new Map();
 // ---------- VAD tuning ----------
 const RMS_ON            = 0.018;   // speech starts above this
 const REALTIME_SAMPLE_RATE = 16000;
+const MIN_REALTIME_COMMIT_SAMPLES = Math.ceil(REALTIME_SAMPLE_RATE * 0.1); // >=100ms
 const USER_SEG_SILENCE_MS = 800;   // end user segment after this much silence
 const USER_SEG_MAX_MS = 12000;     // hard stop user segments
 const ASSISTANT_SEG_IDLE_MS = 1200; // end assistant segment if idle
@@ -334,6 +335,12 @@ async function handleMediaStream(ws) {
     const rt = callState?.realtime;
     if (rt?.ready && rt.ws?.readyState === WebSocket.OPEN) {
       if (rt.inputSamplesBuffered && rt.inputSamplesBuffered > 0) {
+        if (rt.inputSamplesBuffered < MIN_REALTIME_COMMIT_SAMPLES) {
+          const missingSamples = MIN_REALTIME_COMMIT_SAMPLES - rt.inputSamplesBuffered;
+          const silenceBuf = Buffer.alloc(missingSamples * 2);
+          appendAudioToRealtime(silenceBuf);
+          log('warn', '[REALTIME] padded silence before commit', { callSid, missingSamples });
+        }
         try { rt.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); }
         catch (err) { log('error', '[REALTIME] commit failed', { callSid, err: err?.message }); }
         rt.inputSamplesBuffered = 0;
@@ -341,8 +348,15 @@ async function handleMediaStream(ws) {
         log('warn', '[REALTIME] skip commit: empty audio buffer', { callSid });
       }
 
-      try { rt.ws.send(JSON.stringify({ type: 'response.create' })); }
-      catch (err) { log('error', '[REALTIME] response.create failed', { callSid, err: err?.message }); }
+      if (rt.responseInFlight) {
+        log('warn', '[REALTIME] skip response.create: response in progress', { callSid });
+      } else {
+        try {
+          rt.ws.send(JSON.stringify({ type: 'response.create' }));
+          rt.responseInFlight = true;
+        }
+        catch (err) { log('error', '[REALTIME] response.create failed', { callSid, err: err?.message }); }
+      }
     }
 
     log('info', '[SEGMENT] user finalized', { callSid, reason, ms, samples, segmentIndex });
@@ -563,6 +577,7 @@ async function handleMediaStream(ws) {
       const sessionUpdate = {
         type: 'session.update',
         session: {
+          type: 'session',
           model,
           voice: config.realtime_voice || undefined,
           language: config.realtime_language || undefined,
@@ -580,6 +595,7 @@ async function handleMediaStream(ws) {
       catch (e) { log('error', '[REALTIME] failed to send session.update', { callSid, err: e?.message }); }
 
       state.realtime.ready = true;
+      state.realtime.responseInFlight = false;
       attachRealtimeKeepAlive(state);
       log('info', '[REALTIME] session opened', { callSid, model });
     });
@@ -615,12 +631,14 @@ async function handleMediaStream(ws) {
       }
 
       if (evt?.type === 'response.completed' || evt?.type === 'response.output_audio.stopped' || evt?.type === 'response.audio.stopped') {
+        state.realtime.responseInFlight = false;
         finalizeAssistantSegment('realtime-complete');
         return;
       }
 
       if (evt?.type === 'error') {
         rtErrorCount++;
+        state.realtime.responseInFlight = false;
         log('error', '[REALTIME] event error', { callSid, err: evt?.error || evt?.message || evt });
       }
     });
