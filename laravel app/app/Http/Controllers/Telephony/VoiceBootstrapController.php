@@ -17,10 +17,17 @@ class VoiceBootstrapController extends Controller
     {
         $validated = $request->validate([
             'call_id' => ['nullable', 'integer'],
-            'to_number' => ['nullable', 'string', 'required_without:call_id'],
+            'call_sid' => ['nullable', 'string'],
+            'tenant_id' => ['nullable', 'integer'],
+            'to_number' => ['nullable', 'string'],
         ]);
 
-        [$callSession, $tenant] = $this->resolveTenant($validated['call_id'] ?? null, $validated['to_number'] ?? null);
+        [$callSession, $tenant] = $this->resolveTenant(
+            $validated['call_id'] ?? null,
+            $validated['call_sid'] ?? null,
+            $validated['tenant_id'] ?? null,
+            $validated['to_number'] ?? null,
+        );
 
         if (!$tenant) {
             return response()->json(['message' => 'Tenant not found'], 404);
@@ -35,25 +42,19 @@ class VoiceBootstrapController extends Controller
             $rules = is_array($extra['rules']) ? $extra['rules'] : [$extra['rules']];
         }
 
-        $config = [
-            'model' => $openAiSetting?->default_model ?? 'gpt-4o-mini',
-            'prompt' => $openAiSetting?->instructions ?? '',
-            'voice' => $elevenLabsSetting?->elevenlabs_voice_id,
-            'language' => $elevenLabsSetting?->language,
-            'realtime_enabled' => (bool) ($openAiSetting?->realtime_enabled ?? false),
-            'realtime_model' => $openAiSetting?->realtime_model ?? 'gpt-4o-realtime-preview',
-            'realtime_system_prompt' => $openAiSetting?->realtime_system_prompt,
-            'realtime_voice' => $openAiSetting?->realtime_voice ?? $elevenLabsSetting?->elevenlabs_voice_id,
-            'realtime_language' => $openAiSetting?->realtime_language ?? $elevenLabsSetting?->language,
-            'rules' => $rules,
-        ];
-
         return response()->json([
             'call_id' => $callSession?->id,
+            'call_sid' => $callSession?->call_sid,
             'tenant_id' => $tenant->id,
             'ws_url' => $this->mediaStreamUrl($callSession, $tenant),
-            'openai_api_key' => $openAiSetting->api_key_encrypted ?? null,
-            'config' => $config,
+            'openai_api_key' => $openAiSetting?->api_key_encrypted,
+            'model' => $openAiSetting?->realtime_model
+                ?? $openAiSetting?->default_model
+                ?? 'gpt-4o-mini',
+            'realtime_voice' => $openAiSetting?->realtime_voice ?? $elevenLabsSetting?->elevenlabs_voice_id,
+            'realtime_system_prompt' => $openAiSetting?->realtime_system_prompt,
+            'prompt' => $openAiSetting?->instructions ?? '',
+            'rules' => $rules,
         ]);
     }
 
@@ -79,7 +80,7 @@ class VoiceBootstrapController extends Controller
         return sprintf('%s://%s:%s/media-stream?%s', $scheme, $normalizedHost, $port, $query);
     }
 
-    private function resolveTenant(?int $callId, ?string $toNumber): array
+    private function resolveTenant(?int $callId, ?string $callSid, ?int $tenantId, ?string $toNumber): array
     {
         $callSession = null;
         $tenant = null;
@@ -87,6 +88,18 @@ class VoiceBootstrapController extends Controller
         if ($callId) {
             $callSession = CallSession::with('tenant')->find($callId);
             $tenant = $callSession?->tenant;
+        }
+
+        if (!$callSession && $callSid) {
+            $callSession = CallSession::with('tenant')
+                ->where('call_sid', $callSid)
+                ->first();
+
+            $tenant = $callSession?->tenant;
+        }
+
+        if (!$tenant && $tenantId) {
+            $tenant = Tenant::find($tenantId);
         }
 
         if (!$tenant && $toNumber) {
