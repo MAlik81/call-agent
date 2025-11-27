@@ -24,7 +24,12 @@ const DEFAULT_SYSTEM_MESSAGE =
 const DEFAULT_VOICE = 'alloy';
 const DEFAULT_MODEL = 'gpt-realtime';
 const TEMPERATURE = 0.8;
-const PORT = process.env.PORT || 5050;
+const INITIAL_GREETING_TEXT =
+  process.env.INITIAL_GREETING_TEXT ||
+  'Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?';
+const ENABLE_INITIAL_GREETING =
+  (process.env.ENABLE_INITIAL_GREETING || 'false').toLowerCase() === 'true';
+const PORT = 3000;
 
 // Events we log from Realtime
 const LOG_EVENT_TYPES = [
@@ -96,11 +101,11 @@ async function postSegmentToLaravel(segment) {
       timeout: 8000,
       headers: { 'Content-Type': 'application/json' },
     });
-    // console.log('[SEGMENT] posted', {
-    //   role: segment.role,
-    //   idx: segment.segment_index,
-    //   dur: segment.duration_ms,
-    // });
+      console.log('[SEGMENT] posted', {
+        role: segment.role,
+        idx: segment.segment_index,
+        dur: segment.duration_ms,
+      });
   } catch (err) {
     console.error('[SEGMENT] post failed', {
       role: segment.role,
@@ -295,6 +300,28 @@ fastify.register(async (fastifyInstance) => {
         );
       };
 
+      // Optional: have the AI greet first
+      const sendInitialConversationItem = () => {
+        if (!openAiWs || openAiWs.readyState !== WebSocket.OPEN) return;
+
+        const initialConversationItem = {
+          type: 'conversation.item.create',
+          item: {
+            type: 'message',
+            role: 'user',
+            content: [
+              {
+                type: 'input_text',
+                text: INITIAL_GREETING_TEXT,
+              },
+            ],
+          },
+        };
+
+        openAiWs.send(JSON.stringify(initialConversationItem));
+        openAiWs.send(JSON.stringify({ type: 'response.create' }));
+      };
+
       // Create OpenAI Realtime WS *after* we have bootstrap config
       async function initOpenAiRealtime() {
         if (!realtimeModel || !systemMessage) {
@@ -357,9 +384,9 @@ fastify.register(async (fastifyInstance) => {
           );
           openAiWs.send(JSON.stringify(sessionUpdate));
 
-          // If you want AI to speak first, you can send an initial conversation here
-          // openAiWs.send(JSON.stringify({...}));
-          // openAiWs.send(JSON.stringify({ type: 'response.create' }));
+          if (ENABLE_INITIAL_GREETING) {
+            sendInitialConversationItem();
+          }
 
           openAiReady = true;
         });

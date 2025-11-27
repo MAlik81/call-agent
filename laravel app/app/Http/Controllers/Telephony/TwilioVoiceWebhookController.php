@@ -23,7 +23,7 @@ class TwilioVoiceWebhookController extends Controller
         $normalizedHost = trim(str_replace(['wss://', 'ws://', 'https://', 'http://'], '', $host), '/');
         $scheme = $port === 443 ? 'wss' : 'ws';
 
-        return sprintf('%s://%s:%s/media-stream', $scheme, $normalizedHost, $port ?: 443);
+        return sprintf('%s://%s/media-stream', $scheme, $normalizedHost);
     }
 
     /**
@@ -171,7 +171,7 @@ class TwilioVoiceWebhookController extends Controller
 <?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice">You can start conversation now.</Say>
-  <Start>
+  <Connect>
     <Stream url="{$streamUrl}">
       <Parameter name="tenant_id" value="{$tenantXml}"/>
       <Parameter name="tenant_uuid" value="{$tenantUuidXml}"/>
@@ -179,7 +179,7 @@ class TwilioVoiceWebhookController extends Controller
       <Parameter name="call_id"  value="{$callIdXml}"/>
       <Parameter name="to_number" value="{$toNumberXml}"/>
     </Stream>
-  </Start>
+  </Connect>
   <Pause length="600"/>
 </Response>
 XML;

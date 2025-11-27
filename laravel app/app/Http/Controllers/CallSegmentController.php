@@ -25,6 +25,7 @@ class CallSegmentController extends Controller
 
     private function persistSegment(Request $request, ?string $call)
     {
+        try {
         $data = $request->validate([
             'call_id' => 'nullable|integer',
             'call_sid' => 'nullable|string',
@@ -74,7 +75,8 @@ class CallSegmentController extends Controller
             return response()->json(['message' => 'Tenant not found'], Response::HTTP_NOT_FOUND);
         }
 
-        if ($callSession->tenant_id && $callSession->tenant_id !== $tenantId) {
+        if ((int)$callSession->tenant_id && (int)$callSession->tenant_id !== (int)$tenantId) {
+            echo (int)$callSession->tenant_id.'--'.(int)$tenantId;
             return response()->json(['message' => 'Unauthorized for this call session'], Response::HTTP_FORBIDDEN);
         }
 
@@ -143,5 +145,8 @@ class CallSegmentController extends Controller
         ]);
 
         return response()->json(['data' => $segment], Response::HTTP_CREATED);
+        }catch(\Exception $e) {
+            return response()->json(['message' => 'Error: '.$e->getMessage()], Response::HTTP_INTERNAL_SERVER_ERROR);
+        }
     }
 }
