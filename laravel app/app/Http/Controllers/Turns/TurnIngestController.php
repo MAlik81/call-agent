@@ -3,16 +3,14 @@
 namespace App\Http\Controllers\Turns;
 
 use App\Http\Controllers\Controller;
-use App\Models\Appointment;
 use App\Models\AudioAsset;
 use App\Models\CallSession;
 use App\Models\ErrorLogs;
-use App\Models\LlmRun;
 use App\Models\SttJob;
 use App\Models\SystemSetting;
-use App\Models\TempAppointment;
 use App\Models\Tenant;
 use App\Models\OpenAiSetting;
+use App\Services\IntentEngine;
 // ElevenLabs
 use App\Models\ElevenLabs;
 use App\Models\TtsRenders;
@@ -20,7 +18,6 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
-use Carbon\Carbon;
 
 
 
@@ -141,7 +138,10 @@ class TurnIngestController extends Controller
             'from_number' => 'nullable|string',
             'to_number' => 'nullable|string',
             'meta' => 'array',
+            'speaker' => 'nullable|in:user,bot',
         ]);
+
+        $speaker = $data['speaker'] ?? 'user';
 
         // 2) Tenant lookup
         $tenant = Tenant::find($data['tenant_id']);
@@ -176,6 +176,7 @@ class TurnIngestController extends Controller
         $userAudioAsset = AudioAsset::create([
             'tenant_id' => $tenant->id,
             'kind' => 'upload_chunk',
+            'speaker' => $speaker,
             'storage_disk' => 'public',
             'path' => $userFileRel,
             'mime' => 'audio/wav',
@@ -205,21 +206,7 @@ class TurnIngestController extends Controller
         $whisperModel = $openAiSetting?->stt_model ?? 'gpt-4o-mini-transcribe';
         $chatModel = $openAiSetting?->default_model ?? 'gpt-4o-mini';
         $systemPrompt = $openAiSetting?->instructions ?? "You are a concise, friendly IVR assistant.";
-
-        $structuredResponseInstruction = <<<PROMPT
-Reply using JSON with the following shape:
-{
-  "reply": "<concise spoken response>",
-  "appointment": {
-    "customer_name": "<name or null>",
-    "appointment_date": "<YYYY-MM-DD or null>",
-    "appointment_time": "<HH:MM or null>"
-  }
-}
-If there is no appointment intent, set "appointment" to null. Keep "reply" under 50 words and make it sound natural for text-to-speech.
-PROMPT;
-
-        return DB::transaction(function () use ($userFileRel, $data, $call, $openaiKey, $whisperModel, $chatModel, $systemPrompt, $tenant, $assistantDirFullUrl, $assistantDirRel, $userAudioAsset, $logError, $structuredResponseInstruction) {
+        return DB::transaction(function () use ($userFileRel, $data, $call, $openaiKey, $whisperModel, $chatModel, $systemPrompt, $tenant, $assistantDirFullUrl, $assistantDirRel, $userAudioAsset, $logError, $speaker) {
             $userAbsPath = Storage::disk('public')->path($userFileRel);
 
             // 7) STT
@@ -265,231 +252,17 @@ PROMPT;
                 return response()->json(['ok' => false, 'step' => 'stt', 'code' => 'exception'], 500);
             }
 
-            // 8) LLM Reply
-            $llmRun = null;
-            $replyText = $systemPrompt ?? 'Sorry, I could not process your request.';
-            $appointmentData = null;
+            // 8) LLM Reply via Intent Engine
+            $intentEngine = app(IntentEngine::class);
+            $intentResult = $intentEngine->analyze($call, $transcript);
+            $replyText = $intentResult->replyText;
 
-            try {
-                $llmResp = Http::timeout(30)
-                    ->withToken($openaiKey)
-                    ->withOptions(['verify' => false])
-                    ->post('https://api.openai.com/v1/chat/completions', [
-                        'model' => $chatModel,
-                        'temperature' => 0.6,
-                        'messages' => [
-                            ['role' => 'system', 'content' => $systemPrompt],
-                            ['role' => 'system', 'content' => $structuredResponseInstruction],
-                            ['role' => 'user', 'content' => $transcript],
-                        ],
-                        'max_tokens' => 220,
-                    ]);
-
-                $llmJson = $llmResp->ok() ? $llmResp->json() : [];
-                $rawContent = trim(data_get($llmJson, 'choices.0.message.content', ''));
-                $cleanContent = $this->unwrapJsonContent($rawContent);
-                $structured = json_decode($cleanContent, true);
-                if (json_last_error() === JSON_ERROR_NONE && is_array($structured)) {
-                    $replyText = trim($structured['reply'] ?? $replyText);
-                    $appointmentData = $structured['appointment'] ?? null;
-                } else {
-                    $replyText = $rawContent !== '' ? $rawContent : $replyText;
-                }
-
-                // ✅ Save LlmRun outside transaction so it always persists
-
-                try {
-                    $llmRun = LlmRun::create([
-                        'tenant_id' => $tenant->id,
-
-                        'model' => $chatModel,
-                        'status' => $llmResp->ok() ? 'completed' : 'failed',
-                        'input_tokens' => data_get($llmJson, 'usage.prompt_tokens', 0),
-                        'output_tokens' => data_get($llmJson, 'usage.completion_tokens', 0),
-                        'tool_calls' => data_get($llmJson, 'choices.0.message.tool_calls', []),
-                        'temperature' => 0.6,
-                        'system_prompt_snapshot' => $systemPrompt,
-                        'raw_request' => [
-                            'messages' => [
-                                ['role' => 'system', 'content' => $systemPrompt],
-                                ['role' => 'system', 'content' => $structuredResponseInstruction],
-                                ['role' => 'user', 'content' => $transcript],
-                            ],
-                            'model' => $chatModel,
-                            'max_tokens' => 220,
-                        ],
-                        'raw_response' => $llmJson,
-                        'latency_ms' => 0,
-                        'started_at' => now(),
-                        'completed_at' => now(),
-                    ]);
-
-                } catch (\Throwable $e) {
-                    Log::error('Failed to save LlmRun', [
-                        'tenant_id' => $tenant->id,
-                        'error' => $e->getMessage(),
-                        'trace' => $e->getTraceAsString(),
-                    ]);
-                }
-            } catch (\Throwable $e) {
-                $logError($tenant->id, 'LLM', 'fatal', $e->getMessage(), ['trace' => $e->getTraceAsString()]);
-            }
-
-            // 9) Appointment Detection & Booking
-            $appointmentIntent = is_array($appointmentData) && (
-                !empty($appointmentData['customer_name']) ||
-                !empty($appointmentData['appointment_date']) ||
-                !empty($appointmentData['appointment_time'])
-            );
-
-            if ($appointmentIntent) {
-                $temp = TempAppointment::firstOrNew([
-                    'call_sid' => $call->call_sid,
-                ]);
-
-                // ✅ Step 1: Ask for Name
-                if (empty($temp->customer_name)) {
-                    if (!empty($appointmentData['customer_name'])) {
-                        $temp->customer_name = $appointmentData['customer_name'];
-                        $temp->save();
-                    } else {
-                        $replyText = "Can I have your name for the appointment?";
-                        return;
-                    }
-                }
-
-                // ✅ Step 2: Ask for Date
-                if (empty($temp->appointment_date)) {
-                    if (!empty($appointmentData['appointment_date'])) {
-                        $temp->appointment_date = $appointmentData['appointment_date'];
-                        $temp->save();
-                    } else {
-                        $replyText = "On which date would you like the appointment?";
-                        return;
-                    }
-                }
-
-                // ✅ Step 3: Ask for Time
-                if (empty($temp->appointment_time)) {
-                    if (!empty($appointmentData['appointment_time'])) {
-                        $temp->appointment_time = $appointmentData['appointment_time'];
-                        $temp->save();
-                    } else {
-                        $replyText = "What time works best for you?";
-                        return;
-                    }
-                }
-                // ✅ Step 4: All info gathered → Check Appointment & Google Calendar
-                if ($temp->customer_name && $temp->appointment_date && $temp->appointment_time) {
-                    try {
-                        // 🔹 First check directly in Appointments (confirmed bookings only)
-                        $conflict = Appointment::whereDate('start_at', $temp->appointment_date)
-                            ->whereTime('start_at', $temp->appointment_time)
-                            ->where('status', 'confirmed')
-                            ->exists();
-
-                        if ($conflict) {
-                            // Fetch all confirmed appointments for that day
-                            $bookedSlots = Appointment::whereDate('start_at', $temp->appointment_date)
-                                ->where('status', 'confirmed')
-                                ->orderBy('start_at')
-                                ->get(['client_name', 'start_at']);
-
-                            $slotsList = $bookedSlots->map(function ($a) {
-                                return $a->start_at->format('H:i') . " ({$a->client_name})";
-                            })->implode(', ');
-
-                            $replyText = "❌ Sorry {$temp->customer_name}, {$temp->appointment_date} at {$temp->appointment_time} is already booked.
-📅 Booked slots for that day: {$slotsList}.
-Please choose another time.";
-
-                            $temp->status = 'pending';
-                            $temp->save();
-
-                            return;
-                        }
-
-                        // 🔹 If slot free in Appointments, check in Google Calendar
-                        $jsonPath = storage_path("app/{$tenant->google_calendar_json_path}");
-                        if (!file_exists($jsonPath)) {
-                            throw new \Exception("Google Calendar JSON missing for tenant {$tenant->id}");
-                        }
-
-                        $client = new \Google\Client();
-                        $client->setAuthConfig($jsonPath);
-                        $client->addScope(\Google\Service\Calendar::CALENDAR);
-
-                        $service = new \Google\Service\Calendar($client);
-                        $calendarId = 'primary';
-
-                        $startDateTime = Carbon::parse("{$temp->appointment_date} {$temp->appointment_time}:00");
-                        $endDateTime = $startDateTime->copy()->addHour();
-
-                        $events = $service->events->listEvents($calendarId, [
-                            'timeMin' => $startDateTime->toRfc3339String(),
-                            'timeMax' => $endDateTime->toRfc3339String(),
-                            'singleEvents' => true,
-                        ]);
-
-                        if (count($events->getItems()) === 0) {
-                            // ✅ Slot free → Create event in Google Calendar
-                            $event = new \Google\Service\Calendar\Event([
-                                'summary' => "Appointment: {$temp->customer_name}",
-                                'start' => [
-                                    'dateTime' => $startDateTime->toRfc3339String(),
-                                    'timeZone' => config('app.timezone'),
-                                ],
-                                'end' => [
-                                    'dateTime' => $endDateTime->toRfc3339String(),
-                                    'timeZone' => config('app.timezone'),
-                                ],
-                            ]);
-
-                            $createdEvent = $service->events->insert($calendarId, $event);
-
-                            $appointment = Appointment::create([
-                                'tenant_id' => $tenant->id,
-                                'call_session_id' => $call->id,
-                                'service' => 'General Consultation',
-                                'client_name' => $temp->customer_name,
-                                'client_phone' => $call->from_number,
-                                'client_email' => null,
-                                'start_at' => $startDateTime,
-                                'end_at' => $endDateTime,
-                                'timezone' => config('app.timezone'),
-                                'duration_minutes' => 60,
-                                'status' => 'confirmed',
-                                'meta' => [
-                                    'source' => 'ivr_ai',
-                                    'temp_appointment_id' => $temp->id,
-                                    'google_event_id' => $createdEvent->id, // 🔹 store event id
-                                ],
-                            ]);
-
-                            // ✅ Delete from TempAppointment once confirmed
-                            $temp->delete();
-
-                            $replyText = "✅ Thank you {$temp->customer_name}, your appointment is booked for {$temp->appointment_date} at {$temp->appointment_time}.";
-
-                        } else {
-                            // ❌ Conflict in Google Calendar
-                            $replyText = "❌ Sorry {$temp->customer_name}, that time is already booked in the calendar. Please choose another time.";
-                            $temp->status = 'pending';
-                            $temp->save();
-                        }
-                    } catch (\Throwable $e) {
-                        $logError($tenant->id, 'Appointment', 'fatal', $e->getMessage(), [
-                            'trace' => $e->getTraceAsString(),
-                        ]);
-                        $replyText = "⚠️ Sorry, we could not process your appointment request.";
-                    }
-                }
-            }
-            // 10) TTS
+            // 9) TTS
             $elevenLabs = ElevenLabs::where('tenant_id', $tenant->id)->first();
             $mp3Rel = null;
             $ttsRender = null;
             $ttsLatency = 0;
+            $ttsBase64 = null;
             if ($elevenLabs?->elevenlabs_api_key_encrypted && $elevenLabs?->elevenlabs_voice_id) {
                 try {
                     $ttsStart = microtime(true);
@@ -504,12 +277,14 @@ Please choose another time.";
                     if ($ttsResp->ok() && strlen($ttsResp->body()) > 10) {
                         $fname = now()->format('Ymd_Hisv') . '_' . Str::random(6) . '.mp3';
                         $mp3Rel = "{$assistantDirFullUrl}/{$fname}";
-                        
+                        $ttsBase64 = base64_encode($ttsResp->body());
+
                         file_put_contents(Storage::disk('public')->path($assistantDirRel."/".$fname), $ttsResp->body());
 
                         $aiAudioAsset = AudioAsset::create([
                             'tenant_id' => $tenant->id,
                             'kind' => 'tts_output',
+                            'speaker' => 'bot',
                             'storage_disk' => 'public',
                             'path' => $mp3Rel,
                             'mime' => 'audio/mp3',
@@ -543,7 +318,7 @@ Please choose another time.";
                 'tenant_id' => $tenant->id,
 
                 'text' => $replyText,
-                'llm_run_id' => $llmRun?->id,
+                'llm_run_id' => $intentResult->llmRunId,
                 'tts_render_id' => $ttsRender?->id,
                 'audio_asset_id' => $ttsRender?->audio_asset_id ?? null,
                 'latency_ms' => $ttsLatency,
@@ -556,13 +331,18 @@ Please choose another time.";
             $call->markCompleted('normal_flow');
 
             return response()->json([
-                'ok' => true,
-                'asr' => $transcript,
-                'reply' => $replyText,
-                'wav_path' => $userFileRel,
-                'audio_url' => $mp3Rel,
-                'call_id' => $call->id,
-                'messages' => $call->messages()->latest()->take(2)->get(),
+                'type' => 'bot_reply',
+                'text' => $replyText,
+                'audio_b64' => $ttsBase64,
+                'intent' => [
+                    'name' => $intentResult->intentName,
+                    'status' => $intentResult->intentStatus,
+                    'slots' => $intentResult->slots,
+                ],
+                'meta' => [
+                    'call_session_id' => $call->id,
+                    'call_sid' => $call->call_sid,
+                ],
             ]);
         });
     }

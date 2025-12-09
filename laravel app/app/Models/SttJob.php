@@ -21,12 +21,14 @@ class SttJob extends Model
         'mode',
         'status',
         'text',
+        'language',
         'confidence',
         'word_timing',
         'cost_estimate_cents',
         'raw_response',
         'started_at',
         'completed_at',
+        'error_message',
     ];
 
     // Casts
