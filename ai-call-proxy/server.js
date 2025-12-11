@@ -12,6 +12,7 @@ dotenv.config();
 const {
   OPENAI_API_KEY: DEFAULT_OPENAI_API_KEY, // global fallback
   LARAVEL_API_BASE = 'https://mimivirtualagent.com',
+  LARAVEL_API_TOKEN,
 } = process.env;
 
 if (!DEFAULT_OPENAI_API_KEY && !LARAVEL_API_BASE) {
@@ -115,6 +116,70 @@ async function postSegmentToLaravel(segment) {
   }
 }
 
+async function postAudioToIngest({
+  tenantId,
+  callSid,
+  streamSid,
+  callId,
+  audioB64,
+  speaker,
+}) {
+  if (!tenantId || !callSid || !audioB64) return;
+
+  const url = `${LARAVEL_API_BASE}/api/turns/ingest`;
+  const payload = {
+    tenant_id: tenantId,
+    call_sid: callSid,
+    encoding: 'audio/pcmu',
+    audio_b64: audioB64,
+    speaker: speaker || 'user',
+    meta: {
+      streamSid,
+      call_id: callId,
+    },
+  };
+
+  try {
+    await axios.post(url, payload, {
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: LARAVEL_API_TOKEN ? `Bearer ${LARAVEL_API_TOKEN}` : undefined,
+      },
+      timeout: 8000,
+    });
+  } catch (err) {
+    console.error('[INGEST] post failed', err?.response?.data || err.message);
+  }
+}
+
+async function handleBotReplyPayload(payload) {
+  if (
+    payload?.intent &&
+    payload.intent.name === 'BOOK_APPOINTMENT' &&
+    payload.intent.status === 'CONFIRMED'
+  ) {
+    try {
+      await axios.post(
+        `${LARAVEL_API_BASE}/api/appointments/from-bot`,
+        {
+          call_session_id: payload.meta?.call_session_id,
+          intent: payload.intent.name,
+          status: payload.intent.status,
+          slots: payload.intent.slots,
+        },
+        {
+          headers: {
+            Authorization: LARAVEL_API_TOKEN ? `Bearer ${LARAVEL_API_TOKEN}` : undefined,
+            'Content-Type': 'application/json',
+          },
+        },
+      );
+    } catch (err) {
+      console.error('[APPOINTMENT] Failed to forward intent', err?.response?.data || err.message);
+    }
+  }
+}
+
 // ---- Fastify & WS setup ----------------------------------------------
 
 const fastify = Fastify();
@@ -124,6 +189,12 @@ fastify.register(fastifyWs);
 // Simple health check
 fastify.get('/', async (_request, reply) => {
   reply.send({ message: 'Twilio Media Stream Server is running!' });
+});
+
+fastify.post('/bot-replies', async (request, reply) => {
+  const payload = request.body;
+  await handleBotReplyPayload(payload);
+  reply.send({ ok: true });
 });
 
 // NO TwiML route here – your Laravel app returns the <Response> with <Connect><Stream>
@@ -256,6 +327,15 @@ fastify.register(async (fastifyInstance) => {
           reason,
         });
 
+        postAudioToIngest({
+          tenantId,
+          callSid,
+          streamSid,
+          callId,
+          audioB64,
+          speaker: 'user',
+        });
+
         currentUserBuffers = [];
         userSpeechActive = false;
         userSpeechStartMs = null;
@@ -290,6 +370,15 @@ fastify.register(async (fastifyInstance) => {
           end_ms: endMs,
           duration_ms: durationMs,
           reason,
+        });
+
+        postAudioToIngest({
+          tenantId,
+          callSid,
+          streamSid,
+          callId,
+          audioB64,
+          speaker: 'bot',
         });
 
         currentAssistantBuffers = [];

@@ -15,6 +15,7 @@ class AudioAsset extends Model
     protected $fillable = [
         'tenant_id',
         'kind',
+        'speaker',
         'storage_disk',
         'path',
         'mime',

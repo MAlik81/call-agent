@@ -3,13 +3,13 @@
 use Illuminate\Support\Facades\Route;
 
 
-
 use App\Http\Controllers\Telephony\TwilioCallControlController;
 use App\Http\Controllers\Turns\TurnIngestController; // from prev step
 use App\Http\Controllers\Telephony\TwilioVoiceWebhookController;
 use App\Http\Controllers\Telephony\VoiceBootstrapController;
 use App\Http\Controllers\CallSegmentController;
 use App\Http\Controllers\Cron\CronController;
+use App\Http\Controllers\Appointments\BotAppointmentController;
 
 
 
@@ -29,6 +29,7 @@ Route::post('/twilio/calls/stop', [TwilioCallControlController::class, 'stop']);
 
 Route::post('/call-segments', [CallSegmentController::class, 'storeFromProxy']);
 Route::post('/call-sessions/{call}/segments', [CallSegmentController::class, 'store']);
+Route::post('/appointments/from-bot', [BotAppointmentController::class, 'store']);
 
 
 
