@@ -142,6 +142,7 @@ class TurnIngestController extends Controller
         ]);
 
         $speaker = $data['speaker'] ?? 'user';
+        $role = $speaker === 'bot' ? 'assistant' : 'user';
 
         // 2) Tenant lookup
         $tenant = Tenant::find($data['tenant_id']);
@@ -206,7 +207,7 @@ class TurnIngestController extends Controller
         $whisperModel = $openAiSetting?->stt_model ?? 'gpt-4o-mini-transcribe';
         $chatModel = $openAiSetting?->default_model ?? 'gpt-4o-mini';
         $systemPrompt = $openAiSetting?->instructions ?? "You are a concise, friendly IVR assistant.";
-        return DB::transaction(function () use ($userFileRel, $data, $call, $openaiKey, $whisperModel, $chatModel, $systemPrompt, $tenant, $assistantDirFullUrl, $assistantDirRel, $userAudioAsset, $logError, $speaker) {
+        return DB::transaction(function () use ($userFileRel, $data, $call, $openaiKey, $whisperModel, $chatModel, $systemPrompt, $tenant, $assistantDirFullUrl, $assistantDirRel, $userAudioAsset, $logError, $speaker, $role) {
             $userAbsPath = Storage::disk('public')->path($userFileRel);
 
             // 7) STT
@@ -236,7 +237,7 @@ class TurnIngestController extends Controller
                 ]);
 
                 $call->messages()->create([
-                    'role' => 'user',
+                    'role' => $role,
                     'tenant_id' => $tenant->id,
 
                     'text' => $transcript,
@@ -245,11 +246,23 @@ class TurnIngestController extends Controller
                     'audio_asset_id' => $userAudioAsset->id,
                     'started_at' => now()->subMilliseconds($sttLatency),
                     'completed_at' => now(),
-                    'meta' => ['wav_path' => $userFileRel, 'encoding' => $data['encoding'], 'stt_model' => $whisperModel],
+                    'meta' => ['wav_path' => $userFileRel, 'encoding' => $data['encoding'], 'stt_model' => $whisperModel, 'speaker' => $speaker],
                 ]);
             } catch (\Throwable $e) {
                 $logError($tenant->id, 'STT', 'fatal', $e->getMessage(), ['trace' => $e->getTraceAsString()]);
                 return response()->json(['ok' => false, 'step' => 'stt', 'code' => 'exception'], 500);
+            }
+
+            if ($role === 'assistant') {
+                return response()->json([
+                    'ok' => true,
+                    'type' => 'bot_audio_ingested',
+                    'transcript' => $transcript,
+                    'meta' => [
+                        'call_session_id' => $call->id,
+                        'call_sid' => $call->call_sid,
+                    ],
+                ]);
             }
 
             // 8) LLM Reply via Intent Engine
